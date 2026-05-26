@@ -1,0 +1,174 @@
+# Interlude
+
+攔截 AI coding agent（**Claude Code**、**Codex**）與其 API 之間的流量，把每筆
+請求/回應的 prompt 架構（`system` / `tools` / `messages`）落地成 JSONL，用來分析
+固定骨幹 vs 動態插槽，並做跨 agent 比較。
+
+## 原理
+
+兩個 agent 都能用環境變數覆寫 API base URL，所以不需要透明 MITM 或憑證偽造。
+Interlude 是一個**明確的 reverse proxy**：
+
+```
+Claude Code ──(A) 純 HTTP 明文──▶ Interlude proxy ──(B) 正常 HTTPS──▶ api.anthropic.com
+              localhost:8788                       (proxy 當 client 重新加密)
+```
+
+(A) 段沒有 TLS，proxy 直接從 socket 讀到明文 body——這就是攔截點，全程不碰憑證。
+回應沿著 streaming relay 邊轉發邊複製，串流結束後重組 SSE 事件存檔。agent 完全無感。
+
+## 需求
+
+- [`uv`](https://docs.astral.sh/uv/)（本專案 Python 一律走 uv）
+- `claude`（Claude Code CLI）、`codex`（Codex CLI）
+
+## 快速上手
+
+```bash
+# 1. 啟動 proxy（雙 listener）
+uv run proxy.py
+
+# 2. 另開終端，把 Claude Code 指過來
+ANTHROPIC_BASE_URL=http://localhost:8788 claude
+
+# 3. 分析錄到的東西
+uv run analyze.py
+```
+
+proxy 啟動後會印：
+
+```
+[interlude] claude: http://127.0.0.1:8788 -> https://api.anthropic.com
+[interlude] codex:  http://127.0.0.1:8789 -> https://api.openai.com
+[interlude] logging to .interlude/log-<時間戳>.jsonl
+```
+
+每次啟動開一個新的 log 檔；每筆請求印一行 `[claude] POST /v1/messages`；`Ctrl-C` 停止。
+
+## 把 agent 指過來
+
+### Claude Code
+
+環境變數即可（Claude Code 會自行在 base URL 後接 `/v1/messages`）：
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:8788 claude
+# 非互動：
+ANTHROPIC_BASE_URL=http://localhost:8788 claude -p "say hi"
+```
+
+### Codex
+
+Codex 內建的 `openai` provider **不吃** base URL 覆寫（`OPENAI_BASE_URL` 會被忽略），
+必須定義自訂 provider。
+
+一次性快測：
+
+```bash
+codex exec -s read-only \
+  -c model_provider=interlude \
+  -c 'model_providers.interlude.base_url="http://localhost:8789/v1"' \
+  -c 'model_providers.interlude.wire_api="responses"' \
+  "say hi"
+```
+
+長期穩定——寫進 `~/.codex/config.toml`：
+
+```toml
+[model_providers.interlude]
+name = "Interlude"
+base_url = "http://localhost:8789/v1"
+wire_api = "responses"
+```
+
+然後每次用 `-c` 切過去（**別**設頂層 `model_provider`，否則 proxy 沒開時 Codex 會壞）：
+
+```bash
+codex -c model_provider=interlude exec -s read-only "say hi"
+```
+
+> **Note** — 若用 ChatGPT 登入且沒有 `OPENAI_API_KEY`，Codex 對 `api.openai.com` 會回
+> **401**（缺 `api.responses.write` scope）。proxy 照樣完整錄到請求；要 Codex 真的跑通
+> 需要一把有對應 scope 的 OpenAI API key。
+
+## 錄到什麼
+
+log 在 `.interlude/log-<時間戳>.jsonl`，每筆交換**兩行**、用 `id` 配對：
+
+```jsonc
+// kind="request"
+{"id":"ab12…","kind":"request","agent":"claude","wire":"claude-messages",
+ "headers_kept":{…},                  // 已濾掉 authorization / x-api-key
+ "request":{…完整解析後 body…},
+ "extract":{"system":…,"tools":…,"messages":…}}
+
+// kind="response"（同一個 id）
+{"id":"ab12…","kind":"response","agent":"claude","status":200,
+ "stream":true,"event_count":7,"event_types":{…},
+ "reconstructed":{"model":"…","text":"…","usage":{…},"tool_uses":[…]}}
+```
+
+非串流回應（例如 Codex 的 401）則是 `"stream":false,"body":{…}`。
+
+支援的 wire 格式：`claude-messages`（`/v1/messages`）、`codex-responses`（`/responses`）、
+`codex-chat`（`/chat/completions`）。
+
+## 分析
+
+```bash
+uv run analyze.py                    # 讀 .interlude 全部 log
+uv run analyze.py --agent claude     # 只看單一 agent
+uv run analyze.py --max-slots 30     # 多印幾條動態插槽
+uv run analyze.py path/to/log.jsonl  # 指定檔 / glob
+```
+
+報告內容：
+
+- 每個 agent 的 system 大小、**固定骨幹 vs 動態插槽**（例：Claude 注入的 `git status`、
+  日期會被標成動態插槽）。
+- tools 清單、數量、schema key（Claude=`input_schema` / Codex=`parameters`）。
+- 跨 agent 架構比較表。
+
+> 想讓 Codex 的動態插槽浮現，需跑幾個**不同 prompt / 不同時間**的 session（同一個 prompt
+> 的多次 retry 都是同一份 system，只會算成 1 個 distinct 樣本）。
+
+## 一鍵端到端驗證
+
+```bash
+./dogfood.sh
+```
+
+起 proxy → 各打一次 Claude/Codex → 驗請求+回應都錄到、零憑證外洩 → 收掉 proxy，
+最後印 `RESULT: PASS`。
+
+## 安全須知
+
+- `.interlude/` 含**完整 prompt**（程式碼、可能的機密）→ 已 gitignore，**別 commit、別分享**。
+- auth header（`authorization` / `x-api-key` / `cookie`）只轉送、**不寫 log**；`headers_kept`
+  只保留白名單欄位。
+- proxy 剝掉請求的 `accept-encoding`，所以錄到的 bytes 永遠是明文（免處理 gzip/br）。
+- 自查惡意連線：`lsof -nP -iTCP -sTCP:ESTABLISHED | grep Python`，確認 proxy 只連
+  `api.anthropic.com` / `api.openai.com`。
+
+## 擴充新 agent
+
+編 `proxy.py` 頂端的 `LISTENERS`，加一行 `(port, upstream_host, label)`。wire 偵測在
+`detect_wire()`、欄位正規化在 `extract()`（請求）與 `reconstruct()`（回應）。
+
+## 疑難排解
+
+| 症狀 | 原因 / 解法 |
+|---|---|
+| `port 8788 already in use` | 上一個 proxy 還在。`lsof -nP -iTCP:8788 -sTCP:LISTEN` 找 PID → `kill <PID>` |
+| Codex 沒被錄到，啟動印 `provider: openai` | 用了 `OPENAI_BASE_URL` 捷徑，被內建 provider 忽略。改用自訂 provider |
+| Codex 回 401 | ChatGPT 登入無 scope，預期行為；請求仍有錄到 |
+| agent 拒收 `http://` | 退回 TLS：proxy 用自簽 CA 終結 TLS，Claude Code 設 `NODE_EXTRA_CA_CERTS` 信任（目前用不到） |
+
+## 檔案
+
+| 檔 | 用途 |
+|---|---|
+| `proxy.py` | 雙 listener reverse proxy，streaming relay + SSE tee/重組 |
+| `analyze.py` | 跨請求 diff、固定骨幹 vs 動態插槽、跨 agent 比較 |
+| `dogfood.sh` | 一鍵端到端驗證 |
+| `.interlude/` | JSONL 輸出（gitignored，敏感） |
