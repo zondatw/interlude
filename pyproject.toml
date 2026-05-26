@@ -1,0 +1,9 @@
+[project]
+name = "interlude"
+version = "0.1.0"
+description = "Intercept and log AI coding agent <-> API traffic for prompt-architecture analysis."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
