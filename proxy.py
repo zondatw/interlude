@@ -333,7 +333,10 @@ def make_handler(upstream_host, agent_label):
                     self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
                     while True:
-                        chunk = resp.read(65536)
+                        # read1() returns whatever is available now; plain read(n)
+                        # blocks until n bytes accumulate or the stream ends, which
+                        # would buffer the whole SSE response and stall the agent.
+                        chunk = resp.read1(65536)
                         if not chunk:
                             break
                         self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
