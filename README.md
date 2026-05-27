@@ -141,6 +141,66 @@ uv run analyze.py path/to/log.jsonl  # 指定檔 / glob
 起 proxy → 各打一次 Claude/Codex → 驗請求+回應都錄到、零憑證外洩 → 收掉 proxy，
 最後印 `RESULT: PASS`。
 
+## 手動驗證（逐步）
+
+想親手確認每個環節（而不是只跑 `dogfood.sh`）：
+
+**Terminal 1** — 起 proxy：
+
+```bash
+uv run proxy.py
+```
+
+**Terminal 2** — 打一句 Claude Code，應正常回 `PONG`（證明 relay + streaming 沒壞）：
+
+```bash
+ANTHROPIC_BASE_URL=http://localhost:8788 claude -p "Reply with exactly the word PONG and nothing else."
+```
+
+回到 Terminal 1，proxy console 應出現一行 `[claude] POST /v1/messages`。
+
+**檢查 log 落地**（結構摘要，不傾印 prompt 內容）：
+
+```bash
+LOG=$(ls -t .interlude/log-*.jsonl | head -1)
+uv run python - "$LOG" <<'PY'
+import json, re, sys
+recs = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+for r in recs:
+    if r.get("kind", "request") == "request":
+        ex = r.get("extract") or {}
+        present = [k for k in ("system", "tools", "messages") if ex.get(k) is not None]
+        print(f"REQ  {r['agent']:<7} {r['wire']:<16} extract={present}")
+    else:
+        txt = (r.get("reconstructed") or {}).get("text")
+        info = f"text={txt!r}" if r.get("stream") else f"body={type(r.get('body')).__name__}"
+        print(f"RESP {r['agent']:<7} status={r['status']:<3} {info[:70]}")
+blob = "\n".join(json.dumps(r) for r in recs)
+leaks = re.findall(r"Bearer\s+\S{20,}|sk-ant-\S{20,}|eyJ[\w-]{10,}\.eyJ[\w-]{10,}", blob)
+print("\ncredential leaks:", len(leaks))
+PY
+```
+
+預期看到至少一組：
+
+```
+REQ  claude  claude-messages  extract=['system', 'tools', 'messages']
+RESP claude  status=200 text='PONG'
+
+credential leaks: 0
+```
+
+（開頭可能有一筆 `REQ claude unknown` → `RESP claude status=404`，那是 Claude Code 的
+連線預檢 `HEAD /`，可忽略。）
+
+**看架構分析**：
+
+```bash
+uv run analyze.py
+```
+
+驗完在 Terminal 1 按 `Ctrl-C` 收掉 proxy。
+
 ## 安全須知
 
 - `.interlude/` 含**完整 prompt**（程式碼、可能的機密）→ 已 gitignore，**別 commit、別分享**。
