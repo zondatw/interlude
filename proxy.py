@@ -318,6 +318,12 @@ def make_handler(upstream_host, agent_label):
                 log_response(xid, self.AGENT, wire, 502, "", b"", False, error=str(e))
                 return
 
+            # Footgun guard: a ChatGPT-login token 401s against api.openai.com.
+            if self.AGENT == "codex" and resp.status == 401 and self.UPSTREAM == "api.openai.com":
+                print("[interlude] hint: Codex got 401 from api.openai.com. If you log in "
+                      "with ChatGPT (no API key), use route A — base_url "
+                      "http://localhost:8790/backend-api/codex", flush=True)
+
             ctype = resp.getheader("Content-Type", "")
             cenc = resp.getheader("Content-Encoding", "")
             buf, truncated = bytearray(), False

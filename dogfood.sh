@@ -76,6 +76,7 @@ echo "==> Codex through proxy (ChatGPT-login backend)"
     -c 'model_providers.interlude.name="Interlude"' \
     -c "model_providers.interlude.base_url=\"http://localhost:$CODEX_PORT/backend-api/codex\"" \
     -c 'model_providers.interlude.wire_api="responses"' \
+    -m gpt-5.5 \
     "Reply with exactly the word PONG and nothing else." >/dev/null 2>&1 )
 echo "    codex exit: $?"
 
