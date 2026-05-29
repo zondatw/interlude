@@ -29,7 +29,7 @@ import statistics
 import sys
 import threading
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, unquote, urlparse
 
 from analyze import skeleton, system_text, tool_names, tool_schema_key
@@ -154,6 +154,62 @@ def _parse_ts(ts):
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return None
+
+
+def _parse_filter_ts(s):
+    """Parse a UTC timestamp string from a query param or a datetime-local
+    input. Accepts 'YYYY-MM-DDTHH:MM[:SS][.sss][Z]'. Returns a tz-aware UTC
+    datetime, or None on any failure."""
+    if not s:
+        return None
+    try:
+        norm = s.strip().replace("Z", "")
+        # datetime-local input gives 16 chars without seconds; pad them.
+        if len(norm) == 16:
+            norm += ":00"
+        return datetime.fromisoformat(norm).replace(tzinfo=timezone.utc)
+    except (ValueError, AttributeError):
+        return None
+
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$")
+
+
+def _parse_duration(s):
+    """Parse '5m' / '1h' / '24h' / '7d' / '30s' into a timedelta. None on miss."""
+    if not s:
+        return None
+    m = _DURATION_RE.match(s.strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2)
+    return {
+        "s": timedelta(seconds=n),
+        "m": timedelta(minutes=n),
+        "h": timedelta(hours=n),
+        "d": timedelta(days=n),
+    }.get(unit)
+
+
+def _compute_time_range(qs, requests):
+    """Decide (from_dt, to_dt) given the query params and the captured data.
+    `from`/`to` take precedence; `since=Nm|Nh|Nd` is relative to the latest
+    request ts in the data set (so 'last hour' still makes sense for old
+    captures). Anything missing leaves that bound open."""
+    from_dt = _parse_filter_ts((qs.get("from") or [None])[0])
+    to_dt   = _parse_filter_ts((qs.get("to")   or [None])[0])
+    since   = (qs.get("since") or [None])[0]
+    delta = _parse_duration(since) if since else None
+    if delta and not from_dt:
+        latest = None
+        for r in requests:
+            t = _parse_ts(r.get("ts"))
+            if t and (latest is None or t > latest):
+                latest = t
+        if latest:
+            from_dt = latest - delta
+    return from_dt, to_dt
 
 
 def _fmt_gap(seconds):
@@ -314,6 +370,7 @@ def model_timeline(ctx):
     request/response detail straight from ctx for inline expansion so
     /api/timeline stays compact even with large logs."""
     agent_filter = (ctx["qs"].get("agent") or [None])[0]
+    from_dt, to_dt = _compute_time_range(ctx["qs"], ctx["requests"])
     events = []
     prev_ts = None
     exchanges = 0
@@ -322,6 +379,11 @@ def model_timeline(ctx):
             continue
         xid = r.get("id")
         if not xid:
+            continue
+        ts_filter = _parse_ts(r.get("ts"))
+        if from_dt and (ts_filter is None or ts_filter < from_dt):
+            continue
+        if to_dt and (ts_filter is None or ts_filter >= to_dt):
             continue
         resp = ctx["responses"].get(xid, {})
         rc = resp.get("reconstructed") or {}
@@ -372,8 +434,20 @@ def model_timeline(ctx):
         if ts_in_p:
             prev_ts = ts_in_p
         exchanges += 1
-    return {"agent_filter": agent_filter, "exchanges": exchanges,
-            "event_count": len(events), "events": events}
+    return {
+        "agent_filter": agent_filter,
+        "form": {
+            "agent": agent_filter or "",
+            "since": (ctx["qs"].get("since") or [""])[0],
+            "from":  (ctx["qs"].get("from")  or [""])[0],
+            "to":    (ctx["qs"].get("to")    or [""])[0],
+        },
+        "effective_from": from_dt.isoformat() if from_dt else None,
+        "effective_to":   to_dt.isoformat()   if to_dt   else None,
+        "exchanges": exchanges,
+        "event_count": len(events),
+        "events": events,
+    }
 
 
 # =============================================================================
@@ -441,6 +515,36 @@ tr:hover td { background: #fafafa; }
                 margin: 1em 0; flex-wrap: wrap; gap: 0.5em; }
 .seq-controls a { color: #06c; text-decoration: none; }
 .seq-controls a:hover { text-decoration: underline; }
+
+.seq-filter {
+  display: flex; flex-wrap: wrap; align-items: flex-end;
+  gap: 0.6em 0.9em; margin: 0.7em 0 0.4em;
+  padding: 0.7em 0.9em; background: #f7f8fa;
+  border: 1px solid #eef0f3; border-radius: 5px;
+}
+.seq-filter label {
+  display: flex; flex-direction: column; gap: 0.2em;
+  font-size: 0.76em; color: #555; font-weight: 500;
+}
+.seq-filter input, .seq-filter select {
+  font-size: 0.88em; padding: 0.3em 0.45em;
+  border: 1px solid #d0d6dd; border-radius: 3px;
+  background: #fff; font-family: inherit;
+}
+.seq-filter input[type="datetime-local"] { min-width: 14em; }
+.seq-filter button {
+  padding: 0.4em 1em; background: #06c; color: #fff;
+  border: 0; border-radius: 3px; font-weight: 500;
+  cursor: pointer; font-size: 0.9em;
+}
+.seq-filter button:hover { background: #048; }
+.seq-filter a.reset {
+  font-size: 0.85em; color: #888; text-decoration: none;
+  padding: 0.4em 0.2em; align-self: center;
+}
+.seq-filter a.reset:hover { color: #555; text-decoration: underline; }
+.seq-active-range { margin: 0.2em 0 0.4em; }
+.seq-active-range code { font-size: 0.82em; }
 
 .seq { margin: 1em 0; }
 
@@ -854,16 +958,52 @@ def render_timeline(m, ctx=None):
     exchange becomes two arrows: out (request) and in (response). Clicking an
     arrow expands only the matching half — req shows headers/system/tools/
     messages; resp shows reassembled text/usage/event_types."""
-    json_url = ("/api/timeline?agent=" + m["agent_filter"]
-                if m["agent_filter"] else "/api/timeline")
-    body = ["<h1>Timeline</h1>",
-            "<header class='seq-controls'>"
-            "<span>Filter: <a href='/timeline'>all</a> · "
-            "<a href='/timeline?agent=claude'>claude</a> · "
-            "<a href='/timeline?agent=codex'>codex</a></span>"
-            f"<span class='muted'>{m['exchanges']} exchange(s) · "
-            f"{m['event_count']} arrows · oldest first</span>"
-            "</header>"]
+    form = m["form"]
+    # Reconstruct the JSON URL with the same query params so the link in the
+    # nav matches what is currently filtered.
+    qs_bits = []
+    for k in ("agent", "since", "from", "to"):
+        v = form.get(k)
+        if v:
+            qs_bits.append(f"{k}={esc(v)}")
+    json_url = "/api/timeline" + ("?" + "&".join(qs_bits) if qs_bits else "")
+
+    def opt(name, value, current, label=None):
+        sel = " selected" if value == current else ""
+        return f"<option value='{esc(value)}'{sel}>{esc(label or value or '—')}</option>"
+
+    agent_opts = "".join(opt("agent", v, form["agent"], lbl)
+                         for v, lbl in (("", "all"), ("claude", "claude"),
+                                        ("codex", "codex")))
+    since_opts = "".join(opt("since", v, form["since"], lbl)
+                         for v, lbl in (("", "—"), ("5m", "last 5m"),
+                                        ("1h", "last 1h"), ("6h", "last 6h"),
+                                        ("24h", "last 24h"), ("7d", "last 7d")))
+
+    active = ""
+    if m["effective_from"] or m["effective_to"]:
+        from_lbl = esc(m["effective_from"] or "(start)")
+        to_lbl = esc(m["effective_to"] or "(end)")
+        active = (f"<p class='seq-active-range muted'>"
+                  f"active range (UTC): <code>{from_lbl}</code> → "
+                  f"<code>{to_lbl}</code></p>")
+
+    body = [
+        "<h1>Timeline</h1>",
+        f"<form class='seq-filter' method='get' action='/timeline'>"
+        f"<label>agent<select name='agent'>{agent_opts}</select></label>"
+        f"<label>since<select name='since'>{since_opts}</select></label>"
+        f"<label>from (UTC)<input type='datetime-local' name='from' "
+        f"value='{esc(form['from'])}'></label>"
+        f"<label>to (UTC)<input type='datetime-local' name='to' "
+        f"value='{esc(form['to'])}'></label>"
+        f"<button type='submit'>Apply</button>"
+        f"<a class='reset' href='/timeline'>reset</a>"
+        f"</form>",
+        active,
+        f"<p class='muted'>{m['exchanges']} exchange(s) · "
+        f"{m['event_count']} arrows · oldest first</p>",
+    ]
     if not m["events"]:
         body.append("<p class='muted'>(no exchanges matched — capture some "
                     "traffic, or relax the filter)</p>")
