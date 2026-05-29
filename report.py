@@ -1,15 +1,20 @@
 """Interlude analysis web UI — a local browser-facing view over the JSONL logs.
 
 A tiny stdlib HTTP server that reads .interlude/log-*.jsonl and renders:
-  - overview            (/)                cross-agent comparison, per-agent stats
-  - request list        (/requests)        sortable rows linking into detail pages
-  - request detail      (/requests/<id>)   system/tools/messages + paired response
-  - skeleton vs slots   (/skeleton/<agent>) fixed lines greyed, dynamic slots yellow
-  - tools browser       (/tools/<agent>)   collapsible JSON schema per tool
 
-Bound to 127.0.0.1 only (the logs contain full prompts; never expose them on LAN).
-Pure stdlib, single file. Field extraction is delegated to analyze.py so that
-script remains the source of truth for the underlying logic.
+  HTML                              JSON twin                       what
+  /                                 /api/                           overview + per-agent stats
+  /requests[?agent=…]               /api/requests[?agent=…]         list of recent exchanges
+  /requests/<id>                    /api/requests/<id>              full request + paired response
+  /skeleton/<agent>                 /api/skeleton/<agent>           fixed vs dynamic-slot lines
+  /tools/<agent>                    /api/tools/<agent>              tools from the latest request
+
+Bound to 127.0.0.1 only (the logs hold full prompts; never expose them on LAN).
+Pure stdlib, single file, with clear section banners. Each view is split into
+`model_<page>(ctx) -> dict` + `render_<page>(model) -> html`; the same model
+feeds both the HTML page and its `/api/...` JSON twin, so future client-side
+features (charts, search, live update) hit the JSON endpoint instead of
+re-scraping HTML.
 """
 
 import argparse
@@ -19,6 +24,7 @@ import html
 import http.server
 import json
 import os
+import re
 import statistics
 import sys
 import threading
@@ -27,7 +33,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from analyze import skeleton, system_text, tool_names, tool_schema_key
 
-# --- log loading (mtime-cached) ---------------------------------------------
+
+# =============================================================================
+# DATA — log loading, grouping, per-agent aggregation
+# =============================================================================
 
 _CACHE = {}  # path -> (mtime, [records])
 _CACHE_LOCK = threading.Lock()
@@ -35,8 +44,10 @@ _CACHE_LOCK = threading.Lock()
 
 def load_records(glob_pattern):
     """Return (sorted file paths, flat record list). Reuse parsed records when
-    a file's mtime hasn't changed. JSON decode errors are skipped silently
-    because the proxy may be appending while we read."""
+    a file's mtime is unchanged. Pre-Phase-4 records get a synthesized stable
+    id so they still appear in the UI. JSON decode errors are skipped silently
+    because the proxy may be appending while we read.
+    """
     paths = sorted(glob.glob(glob_pattern))
     all_recs = []
     with _CACHE_LOCK:
@@ -60,9 +71,6 @@ def load_records(glob_pattern):
                             r = json.loads(line)
                         except ValueError:
                             continue
-                        # Pre-Phase-4 records have no `id` — synthesize a stable
-                        # one from (path, line) so they still get URLs and the
-                        # skeleton view sees their distinct system samples.
                         if not r.get("id"):
                             r["id"] = hashlib.blake2s(
                                 f"{p}#{line_no}".encode(), digest_size=6
@@ -78,8 +86,7 @@ def load_records(glob_pattern):
 def group_records(recs):
     """Split into (request list, response-by-id dict). Pre-Phase-4 records
     without a `kind` field are treated as requests."""
-    requests = []
-    responses = {}
+    requests, responses = [], {}
     for r in recs:
         kind = r.get("kind", "request")
         if kind == "request":
@@ -91,23 +98,173 @@ def group_records(recs):
     return requests, responses
 
 
-# --- HTML scaffolding --------------------------------------------------------
+def agent_facts(requests):
+    """{agent: {numbers for the overview table}}."""
+    by_agent = defaultdict(list)
+    for r in requests:
+        if r.get("extract") is not None:
+            by_agent[r.get("agent", "?")].append(r)
+    out = {}
+    for agent, recs in by_agent.items():
+        samples = []
+        for r in recs:
+            t, _ = system_text(r)
+            if t is not None:
+                samples.append(t)
+        distinct = list(dict.fromkeys(samples))
+        sk = skeleton(distinct) if distinct else None
+        name_lists = [nl for r in recs if (nl := tool_names(r)) is not None]
+        union = set()
+        for nl in name_lists:
+            union.update(nl)
+        out[agent] = {
+            "reqs": len(recs),
+            "distinct": sk["distinct"] if sk else 0,
+            "sys_median": (int(statistics.median(len(t) for t in samples))
+                           if samples else 0),
+            "fixed": sk["fixed"] if sk else 0,
+            "unique_lines": sk["unique_lines"] if sk else 0,
+            "dynamic_count": len(sk["dynamic_lines"]) if sk else 0,
+            "tool_count": len(union),
+            "tool_key": next((tool_schema_key(r) for r in recs
+                              if tool_schema_key(r) != "n/a"), "n/a"),
+        }
+    return out
+
+
+def _usage_cells(usage):
+    """Pull (input, output, cached) from either anthropic-style or openai-style usage."""
+    if not isinstance(usage, dict):
+        return None, None, None
+    i_tok = usage.get("input_tokens") or usage.get("prompt_tokens")
+    o_tok = usage.get("output_tokens") or usage.get("completion_tokens")
+    cached = (
+        (usage.get("input_tokens_details") or {}).get("cached_tokens")
+        or usage.get("cache_read_input_tokens")
+        or usage.get("cache_creation_input_tokens")
+    )
+    return i_tok, o_tok, cached
+
+
+# =============================================================================
+# MODELS — pure data prep per view. Return JSON-serializable dicts.
+# A view returning None signals 404.
+# =============================================================================
+
+
+def model_overview(ctx):
+    return {
+        "files": ctx["paths"],
+        "request_count": len(ctx["requests"]),
+        "response_count": len(ctx["responses"]),
+        "agents": agent_facts(ctx["requests"]),
+    }
+
+
+def model_requests(ctx):
+    agent_filter = (ctx["qs"].get("agent") or [None])[0]
+    rows = []
+    for r in sorted(ctx["requests"], key=lambda x: x.get("ts", ""), reverse=True):
+        if agent_filter and r.get("agent") != agent_filter:
+            continue
+        xid = r.get("id")
+        if not xid:
+            continue
+        resp = ctx["responses"].get(xid, {})
+        rc = resp.get("reconstructed") or {}
+        i_tok, o_tok, cached = _usage_cells(rc.get("usage"))
+        rows.append({
+            "id": xid,
+            "ts": r.get("ts"),
+            "agent": r.get("agent"),
+            "wire": r.get("wire"),
+            "method": r.get("method"),
+            "path": r.get("path"),
+            "status": resp.get("status"),
+            "model": rc.get("model") or (r.get("request") or {}).get("model"),
+            "tokens_in": i_tok,
+            "tokens_out": o_tok,
+            "tokens_cached": cached,
+        })
+    return {"agent_filter": agent_filter, "rows": rows}
+
+
+def model_request(ctx):
+    xid = ctx["params"]["xid"]
+    req = next((r for r in ctx["requests"] if r.get("id") == xid), None)
+    if not req:
+        return None  # → 404
+    resp = ctx["responses"].get(xid)
+    sys_text, _ = system_text(req)
+    ex = req.get("extract") or {}
+    return {
+        "id": xid,
+        "request": {
+            "ts": req.get("ts"),
+            "agent": req.get("agent"),
+            "wire": req.get("wire"),
+            "method": req.get("method"),
+            "path": req.get("path"),
+            "headers_kept": req.get("headers_kept") or {},
+            "system": sys_text,
+            "system_chars": len(sys_text) if sys_text else 0,
+            "tools": ex.get("tools"),
+            "messages": ex.get("messages"),
+        },
+        "response": resp,  # raw — JSON consumers and renderer share access
+    }
+
+
+def model_skeleton(ctx):
+    agent = ctx["params"]["agent"]
+    recs = [r for r in ctx["requests"]
+            if r.get("agent") == agent and r.get("extract") is not None]
+    samples = []
+    for r in recs:
+        t, _ = system_text(r)
+        if t is not None:
+            samples.append(t)
+    distinct = list(dict.fromkeys(samples))
+    if not distinct:
+        return {"agent": agent, "distinct": 0, "fixed": 0, "unique_lines": 0,
+                "dynamic_lines": [], "canonical": None}
+    sk = skeleton(distinct)
+    return {
+        "agent": agent,
+        "distinct": sk["distinct"],
+        "fixed": sk["fixed"],
+        "unique_lines": sk["unique_lines"],
+        "dynamic_lines": sk["dynamic_lines"],
+        "canonical": distinct[0],
+    }
+
+
+def model_tools(ctx):
+    agent = ctx["params"]["agent"]
+    recs = [r for r in ctx["requests"]
+            if r.get("agent") == agent and r.get("extract") is not None]
+    tools, chosen_ts = None, None
+    for r in sorted(recs, key=lambda x: x.get("ts", ""), reverse=True):
+        ex = r.get("extract") or {}
+        t = ex.get("tools")
+        if isinstance(t, list) and t:
+            tools, chosen_ts = t, r.get("ts")
+            break
+    return {"agent": agent, "ts": chosen_ts, "tools": tools or []}
+
+
+# =============================================================================
+# HTML PRIMITIVES — escape, page wrapper, JSON tree, shared CSS
+# =============================================================================
 
 CSS = """
+/* === reset / shared layout === */
 * { box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
        max-width: 1180px; margin: 0 auto; padding: 1em 2em 4em; color: #222; line-height: 1.5; }
-nav { padding: 0.6em 0; border-bottom: 1px solid #eee; margin-bottom: 1.5em; }
-nav a { margin-right: 1.2em; text-decoration: none; color: #06c; font-weight: 500; }
-nav a:hover { text-decoration: underline; }
 h1 { border-bottom: 2px solid #ddd; padding-bottom: 0.3em; margin-top: 0.4em; }
 h2 { margin-top: 1.8em; color: #333; }
-h3 { color: #444; margin-top: 1.3em; }
-table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-th, td { border-bottom: 1px solid #eee; padding: 0.45em 0.7em; text-align: left;
-         font-size: 0.88em; vertical-align: top; }
-th { background: #f7f7f9; position: sticky; top: 0; font-weight: 600; }
-tr:hover td { background: #fafafa; }
+h3, h4 { color: #444; margin-top: 1.3em; }
 code, pre { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.85em; }
 code { background: #f1f3f5; padding: 0.1em 0.35em; border-radius: 3px; }
 pre { background: #f6f8fa; padding: 1em; border-radius: 4px; overflow-x: auto;
@@ -117,48 +274,72 @@ pre code { background: none; padding: 0; }
 details { margin: 0.4em 0; }
 summary { cursor: pointer; padding: 0.25em 0; user-select: none; }
 summary:hover { color: #06c; }
-.skeleton { background: #f8f8fa; padding: 1em; border-radius: 4px; overflow-x: auto;
-            white-space: pre-wrap; word-wrap: break-word; max-height: 700px;
-            border: 1px solid #eaecef; font-family: ui-monospace, monospace;
-            font-size: 0.85em; line-height: 1.6; }
-.fixed { color: #999; }
-.dyn { background: #fff3a3; padding: 0 2px; border-radius: 2px; color: #222; font-weight: 500; }
-.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.4em 1.2em; margin: 0.6em 0; }
-.kv dt { font-weight: 500; color: #555; }
-.kv dd { margin: 0; }
-.muted { color: #888; font-size: 0.88em; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border-bottom: 1px solid #eee; padding: 0.45em 0.7em; text-align: left;
+         font-size: 0.88em; vertical-align: top; }
+th { background: #f7f7f9; position: sticky; top: 0; font-weight: 600; }
+tr:hover td { background: #fafafa; }
+
+/* === shared atoms === */
 .tag { display: inline-block; padding: 0.12em 0.55em; border-radius: 3px;
        background: #eef; font-size: 0.82em; color: #339; font-weight: 500; }
 .tag.claude { background: #fde7d8; color: #963; }
 .tag.codex { background: #def0ff; color: #246; }
+.muted { color: #888; font-size: 0.88em; }
 .status-ok { color: #185; font-weight: 500; }
 .status-err { color: #c33; font-weight: 500; }
-.json-key { color: #905; font-weight: 500; }
-.json-idx { color: #999; font-size: 0.75em; margin-right: 0.4em; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.4em 1.2em; margin: 0.6em 0; }
+.kv dt { font-weight: 500; color: #555; }
+.kv dd { margin: 0; }
+
+/* === nav === */
+.nav { padding: 0.6em 0; border-bottom: 1px solid #eee; margin-bottom: 1.5em; }
+.nav a { margin-right: 1.2em; text-decoration: none; color: #06c; font-weight: 500; }
+.nav a:hover { text-decoration: underline; }
+.nav .api { float: right; font-size: 0.85em; color: #888; }
+.nav .api a { color: #888; font-weight: 400; }
+
+/* === json tree (shared) === */
 .json-tree > div { margin-left: 1.5em; padding-left: 0.3em;
                    border-left: 1px solid #eee; }
-"""
+.json-key { color: #905; font-weight: 500; }
+.json-idx { color: #999; font-size: 0.75em; margin-right: 0.4em; }
 
-NAV = ('<nav>'
-       '<a href="/">Overview</a>'
-       '<a href="/requests">Requests</a>'
-       '</nav>')
+/* === skeleton view === */
+.skel-canvas { background: #f8f8fa; padding: 1em; border-radius: 4px; overflow-x: auto;
+               white-space: pre-wrap; word-wrap: break-word; max-height: 700px;
+               border: 1px solid #eaecef; font-family: ui-monospace, monospace;
+               font-size: 0.85em; line-height: 1.6; }
+.skel-fixed { color: #999; }
+.skel-dyn { background: #fff3a3; padding: 0 2px; border-radius: 2px; color: #222; font-weight: 500; }
+"""
 
 
 def esc(value):
     return html.escape(str(value)) if value is not None else ""
 
 
-def page(title, body_html):
+def _nav(json_url=None):
+    api = (f'<span class="api">JSON: '
+           f'<a href="{esc(json_url)}">{esc(json_url)}</a></span>') if json_url else ""
+    return (f'<nav class="nav">'
+            f'<a href="/">Overview</a>'
+            f'<a href="/requests">Requests</a>'
+            f'{api}'
+            f'</nav>')
+
+
+def page(title, body_html, json_url=None):
     return ("<!doctype html><html lang='en'><head>"
             "<meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
             f"<title>{esc(title)} · Interlude</title>"
-            f"<style>{CSS}</style></head><body>{NAV}{body_html}</body></html>")
+            f"<style>{CSS}</style></head><body>"
+            f"{_nav(json_url)}{body_html}</body></html>")
 
 
 def render_json(obj, depth=0):
-    """Recursive collapsible JSON tree. Top level dicts/lists default to open."""
+    """Recursive collapsible JSON tree. Top-level dicts/lists default to open."""
     if isinstance(obj, dict):
         if not obj:
             return "<code>{}</code>"
@@ -193,55 +374,19 @@ def render_json(obj, depth=0):
     return f"<code>{esc(json.dumps(obj))}</code>"
 
 
-# --- per-agent fact aggregation ---------------------------------------------
+# =============================================================================
+# RENDERERS — pure model dict -> HTML string
+# =============================================================================
 
 
-def agent_facts(requests):
-    """Return {agent: {...numbers for the overview table...}}."""
-    by_agent = defaultdict(list)
-    for r in requests:
-        if r.get("extract") is not None:
-            by_agent[r.get("agent", "?")].append(r)
-    out = {}
-    for agent, recs in by_agent.items():
-        sys_samples = []
-        for r in recs:
-            t, _ = system_text(r)
-            if t is not None:
-                sys_samples.append(t)
-        distinct = list(dict.fromkeys(sys_samples))
-        sk = skeleton(distinct) if distinct else None
-        name_lists = [nl for r in recs if (nl := tool_names(r)) is not None]
-        union = set()
-        for nl in name_lists:
-            union.update(nl)
-        key = next((tool_schema_key(r) for r in recs
-                    if tool_schema_key(r) != "n/a"), "n/a")
-        out[agent] = {
-            "reqs": len(recs),
-            "distinct": sk["distinct"] if sk else 0,
-            "sys_median": int(statistics.median(len(t) for t in sys_samples))
-                          if sys_samples else 0,
-            "fixed": sk["fixed"] if sk else 0,
-            "unique_lines": sk["unique_lines"] if sk else 0,
-            "dynamic_count": len(sk["dynamic_lines"]) if sk else 0,
-            "tool_count": len(union),
-            "tool_key": key,
-        }
-    return out
-
-
-# --- route renderers --------------------------------------------------------
-
-
-def render_overview(paths, requests, responses):
-    facts = agent_facts(requests)
+def render_overview(m):
     body = ["<h1>Interlude</h1>",
             "<p class='muted'>"
-            f"{len(paths)} log file(s) · "
-            f"{len(requests)} request record(s) · "
-            f"{len(responses)} response record(s)"
+            f"{len(m['files'])} log file(s) · "
+            f"{m['request_count']} request record(s) · "
+            f"{m['response_count']} response record(s)"
             "</p>"]
+    facts = m["agents"]
     if not facts:
         body.append("<p>No analyzable records yet. Start the proxy "
                     "(<code>uv run proxy.py</code>) and capture some traffic.</p>")
@@ -252,11 +397,11 @@ def render_overview(paths, requests, responses):
                     "<th>dynamic slots</th><th>tools</th><th>schema key</th>"
                     "<th></th></tr>")
         for agent, f in sorted(facts.items()):
-            tag = f"<span class='tag {esc(agent)}'>{esc(agent)}</span>"
             ratio = (f"{f['fixed']}/{f['unique_lines']}"
                      if f['unique_lines'] else "—")
             body.append(
-                f"<tr><td>{tag}</td><td>{f['reqs']}</td>"
+                f"<tr><td><span class='tag {esc(agent)}'>{esc(agent)}</span></td>"
+                f"<td>{f['reqs']}</td>"
                 f"<td>{f['distinct']}</td><td>{f['sys_median']}</td>"
                 f"<td>{ratio}</td><td>{f['dynamic_count']}</td>"
                 f"<td>{f['tool_count']}</td>"
@@ -266,26 +411,13 @@ def render_overview(paths, requests, responses):
             )
         body.append("</table>")
     body.append("<h2>Source files</h2><ul>")
-    for p in paths:
+    for p in m["files"]:
         body.append(f"<li><code>{esc(p)}</code></li>")
     body.append("</ul>")
-    return page("Overview", "".join(body))
+    return page("Overview", "".join(body), json_url="/api/")
 
 
-def _usage_cells(usage):
-    if not isinstance(usage, dict):
-        return "", "", ""
-    i_tok = usage.get("input_tokens") or usage.get("prompt_tokens") or ""
-    o_tok = usage.get("output_tokens") or usage.get("completion_tokens") or ""
-    details = usage.get("input_tokens_details") or {}
-    cached = (details.get("cached_tokens")
-              or usage.get("cache_read_input_tokens")
-              or usage.get("cache_creation_input_tokens")
-              or "")
-    return i_tok, o_tok, cached
-
-
-def render_requests(requests, responses, agent_filter=None):
+def render_requests(m):
     body = ["<h1>Requests</h1>",
             "<p class='muted'>"
             "<a href='/requests'>all</a> · "
@@ -295,64 +427,50 @@ def render_requests(requests, responses, agent_filter=None):
             "<table><tr><th>ts (UTC)</th><th>agent</th><th>wire</th>"
             "<th>path</th><th>status</th><th>model</th>"
             "<th>tokens in / out / cached</th></tr>"]
-    rows = 0
-    for r in sorted(requests, key=lambda x: x.get("ts", ""), reverse=True):
-        if agent_filter and r.get("agent") != agent_filter:
-            continue
-        xid = r.get("id")
-        if not xid:
-            continue  # pre-Phase-4 records have no id
-        resp = responses.get(xid, {})
-        rc = resp.get("reconstructed") or {}
-        i_tok, o_tok, cached = _usage_cells(rc.get("usage"))
-        model = rc.get("model") or (r.get("request") or {}).get("model") or ""
-        status = resp.get("status")
+    for r in m["rows"]:
+        status = r["status"]
         s_class = ("status-ok"
                    if isinstance(status, int) and status < 400
                    else "status-err")
         body.append(
-            f"<tr><td>{esc(r.get('ts', ''))}</td>"
-            f"<td><span class='tag {esc(r.get('agent', ''))}'>{esc(r.get('agent', ''))}</span></td>"
-            f"<td>{esc(r.get('wire', ''))}</td>"
-            f"<td><a href='/requests/{esc(xid)}'><code>{esc(r.get('path', ''))}</code></a></td>"
+            f"<tr><td>{esc(r['ts'])}</td>"
+            f"<td><span class='tag {esc(r['agent'])}'>{esc(r['agent'])}</span></td>"
+            f"<td>{esc(r['wire'])}</td>"
+            f"<td><a href='/requests/{esc(r['id'])}'><code>{esc(r['path'])}</code></a></td>"
             f"<td class='{s_class}'>{esc(status) if status is not None else '—'}</td>"
-            f"<td><code>{esc(model)}</code></td>"
-            f"<td>{esc(i_tok)} / {esc(o_tok)} / {esc(cached)}</td></tr>"
+            f"<td><code>{esc(r['model'] or '')}</code></td>"
+            f"<td>{esc(r['tokens_in'] or '')} / "
+            f"{esc(r['tokens_out'] or '')} / "
+            f"{esc(r['tokens_cached'] or '')}</td></tr>"
         )
-        rows += 1
     body.append("</table>")
-    if rows == 0:
+    if not m["rows"]:
         body.append("<p class='muted'>(no matching requests)</p>")
-    return page("Requests", "".join(body))
+    json_url = ("/api/requests?agent=" + m["agent_filter"]
+                if m["agent_filter"] else "/api/requests")
+    return page("Requests", "".join(body), json_url=json_url)
 
 
-def render_request(xid, requests, responses):
-    req = next((r for r in requests if r.get("id") == xid), None)
-    if not req:
-        return None
-    resp = responses.get(xid)
-    body = [f"<h1>Request <code>{esc(xid)}</code></h1>",
+def render_request(m):
+    req = m["request"]
+    resp = m["response"]
+    body = [f"<h1>Request <code>{esc(m['id'])}</code></h1>",
             "<dl class='kv'>"]
     for k in ("ts", "agent", "wire", "method", "path"):
         body.append(f"<dt>{esc(k)}</dt><dd><code>{esc(req.get(k, ''))}</code></dd>")
     body.append("</dl>")
 
-    kept = req.get("headers_kept") or {}
-    if kept:
+    if req["headers_kept"]:
         body.append("<h3>headers (kept)</h3>")
-        body.append(render_json(kept))
+        body.append(render_json(req["headers_kept"]))
 
-    ex = req.get("extract") or {}
+    if req["system"] is not None:
+        body.append(f"<h2>system <span class='muted'>"
+                    f"({req['system_chars']} chars)</span></h2>"
+                    f"<details><summary>full text</summary>"
+                    f"<pre>{esc(req['system'])}</pre></details>")
 
-    sys_blocks = ex.get("system")
-    if sys_blocks is not None:
-        text, _ = system_text(req)
-        n = len(text) if text else 0
-        body.append(f"<h2>system <span class='muted'>({n} chars)</span></h2>")
-        body.append(f"<details><summary>full text</summary>"
-                    f"<pre>{esc(text)}</pre></details>")
-
-    tools = ex.get("tools")
+    tools = req["tools"]
     if isinstance(tools, list):
         body.append(f"<h2>tools <span class='muted'>({len(tools)})</span></h2>")
         for t in tools:
@@ -366,13 +484,13 @@ def render_request(xid, requests, responses):
             body.append(f"<details><summary><code>{esc(n)}</code></summary>"
                         f"{render_json(t)}</details>")
 
-    msgs = ex.get("messages")
+    msgs = req["messages"]
     if isinstance(msgs, list):
         body.append(f"<h2>messages <span class='muted'>({len(msgs)})</span></h2>")
-        for i, m in enumerate(msgs):
-            role = (m.get("role") if isinstance(m, dict) else None) or "?"
+        for i, msg in enumerate(msgs):
+            role = (msg.get("role") if isinstance(msg, dict) else None) or "?"
             body.append(f"<details><summary>[{i}] role=<code>{esc(role)}</code></summary>"
-                        f"{render_json(m)}</details>")
+                        f"{render_json(msg)}</details>")
 
     body.append("<h2>response</h2>")
     if not resp:
@@ -411,70 +529,56 @@ def render_request(xid, requests, responses):
                     body.append(f"<pre>{esc(b)}</pre>")
                 else:
                     body.append(render_json(b))
-    return page(f"Request {xid}", "".join(body))
+    return page(f"Request {m['id']}", "".join(body),
+                json_url=f"/api/requests/{m['id']}")
 
 
-def render_skeleton(agent, requests):
-    recs = [r for r in requests
-            if r.get("agent") == agent and r.get("extract") is not None]
-    sys_samples = []
-    for r in recs:
-        t, _ = system_text(r)
-        if t is not None:
-            sys_samples.append(t)
-    distinct = list(dict.fromkeys(sys_samples))
+def render_skeleton(m):
+    agent = m["agent"]
     body = [f"<h1>Skeleton vs slots · "
             f"<span class='tag {esc(agent)}'>{esc(agent)}</span></h1>"]
-    if not distinct:
+    if m["distinct"] == 0:
         body.append("<p>No system samples captured for this agent.</p>")
-        return page(f"Skeleton {agent}", "".join(body))
-    sk = skeleton(distinct)
-    body.append(f"<p class='muted'>{sk['distinct']} distinct sample(s) · "
-                f"{sk['fixed']}/{sk['unique_lines']} lines fixed · "
-                f"{len(sk['dynamic_lines'])} dynamic slot line(s)</p>")
-    if sk["distinct"] < 2:
+        return page(f"Skeleton {agent}", "".join(body),
+                    json_url=f"/api/skeleton/{agent}")
+    body.append(f"<p class='muted'>{m['distinct']} distinct sample(s) · "
+                f"{m['fixed']}/{m['unique_lines']} lines fixed · "
+                f"{len(m['dynamic_lines'])} dynamic slot line(s)</p>")
+    if m["distinct"] < 2:
         body.append("<p>Only 1 distinct system seen — capture more varied "
                     "sessions to surface dynamic slots.</p>"
                     "<h2>system text</h2>"
-                    f"<pre>{esc(distinct[0])}</pre>")
+                    f"<pre>{esc(m['canonical'])}</pre>")
     else:
-        dyn_set = set(sk["dynamic_lines"])
+        dyn_set = set(m["dynamic_lines"])
         body.append("<h2>canonical sample "
-                    "<span class='muted'>(first distinct, dynamic lines highlighted)</span></h2>")
-        body.append("<div class='skeleton'>")
-        for ln in distinct[0].split("\n"):
-            cls = "dyn" if ln in dyn_set else "fixed"
+                    "<span class='muted'>(first distinct, dynamic lines highlighted)</span></h2>"
+                    "<div class='skel-canvas'>")
+        for ln in m["canonical"].split("\n"):
+            cls = "skel-dyn" if ln in dyn_set else "skel-fixed"
             body.append(f"<span class='{cls}'>{esc(ln)}</span>\n")
         body.append("</div>")
         body.append(f"<h2>all dynamic-slot lines "
-                    f"<span class='muted'>({len(sk['dynamic_lines'])})</span></h2>"
+                    f"<span class='muted'>({len(m['dynamic_lines'])})</span></h2>"
                     "<ol>")
-        for ln in sk["dynamic_lines"]:
+        for ln in m["dynamic_lines"]:
             if ln.strip():
                 body.append(f"<li><code>{esc(ln[:400])}</code></li>")
         body.append("</ol>")
-    return page(f"Skeleton {agent}", "".join(body))
+    return page(f"Skeleton {agent}", "".join(body),
+                json_url=f"/api/skeleton/{agent}")
 
 
-def render_tools(agent, requests):
-    recs = [r for r in requests
-            if r.get("agent") == agent and r.get("extract") is not None]
-    tools = None
-    chosen_ts = None
-    for r in sorted(recs, key=lambda x: x.get("ts", ""), reverse=True):
-        ex = r.get("extract") or {}
-        t = ex.get("tools")
-        if isinstance(t, list) and t:
-            tools = t
-            chosen_ts = r.get("ts")
-            break
+def render_tools(m):
+    agent = m["agent"]
     body = [f"<h1>Tools · <span class='tag {esc(agent)}'>{esc(agent)}</span></h1>"]
-    if not tools:
+    if not m["tools"]:
         body.append("<p>No tools captured for this agent.</p>")
-        return page(f"Tools {agent}", "".join(body))
-    body.append(f"<p class='muted'>{len(tools)} tool(s) "
-                f"from the most recent request ({esc(chosen_ts)})</p>")
-    for t in tools:
+        return page(f"Tools {agent}", "".join(body),
+                    json_url=f"/api/tools/{agent}")
+    body.append(f"<p class='muted'>{len(m['tools'])} tool(s) "
+                f"from the most recent request ({esc(m['ts'])})</p>")
+    for t in m["tools"]:
         if not isinstance(t, dict):
             continue
         n = (t.get("name")
@@ -483,30 +587,71 @@ def render_tools(agent, requests):
              or "<unknown>")
         body.append(f"<details><summary><code>{esc(n)}</code></summary>"
                     f"{render_json(t)}</details>")
-    return page(f"Tools {agent}", "".join(body))
+    return page(f"Tools {agent}", "".join(body),
+                json_url=f"/api/tools/{agent}")
 
 
-# --- HTTP handler -----------------------------------------------------------
+# =============================================================================
+# ROUTING — one table, twin /api JSON via prefix strip
+# =============================================================================
+
+
+ROUTES = [
+    # (regex,                                                model,         renderer)
+    (re.compile(r"^/$"),                                    model_overview, render_overview),
+    (re.compile(r"^/requests$"),                            model_requests, render_requests),
+    (re.compile(r"^/requests/(?P<xid>[0-9a-f]+)$"),         model_request,  render_request),
+    (re.compile(r"^/skeleton/(?P<agent>[a-zA-Z0-9_-]+)$"),  model_skeleton, render_skeleton),
+    (re.compile(r"^/tools/(?P<agent>[a-zA-Z0-9_-]+)$"),     model_tools,    render_tools),
+]
+
+
+def dispatch(url_path, qs, ctx_base):
+    """Match against ROUTES and return (status, content_type, body_bytes).
+    `/api/...` prefix selects JSON output sharing the same model functions.
+    Returns None when no route matches.
+    """
+    # Strip /api/ prefix → JSON twin. /api alone (no slash) and /api/ both map
+    # to overview-as-JSON.
+    json_mode = url_path == "/api" or url_path.startswith("/api/")
+    inner = url_path
+    if json_mode:
+        inner = url_path[4:] or "/"  # /api → "" → "/"
+        if not inner.startswith("/"):
+            inner = "/" + inner
+
+    for pattern, model_fn, render_fn in ROUTES:
+        match = pattern.match(inner)
+        if not match:
+            continue
+        ctx = {**ctx_base, "qs": qs, "params": match.groupdict()}
+        model = model_fn(ctx)
+        if model is None:  # explicit not-found
+            if json_mode:
+                return (404, "application/json",
+                        b'{"error":"not found"}')
+            return (404, "text/html; charset=utf-8",
+                    page("Not found", "<h1>404</h1>").encode("utf-8"))
+        if json_mode:
+            data = json.dumps(model, ensure_ascii=False, default=str).encode("utf-8")
+            return 200, "application/json", data
+        return 200, "text/html; charset=utf-8", render_fn(model).encode("utf-8")
+    return None
+
+
+# =============================================================================
+# SERVER — HTTP handler + main entry point
+# =============================================================================
 
 
 def make_handler(logs_glob):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
-            pass  # silence default access log
-
-        def _send(self, status, body, ctype="text/html; charset=utf-8"):
-            data = body.encode("utf-8")
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            pass
 
         def do_GET(self):
             url = urlparse(self.path)
-            path = url.path
-            qs = parse_qs(url.query)
-
+            path = unquote(url.path)
             if path == "/favicon.ico":
                 self.send_response(204)
                 self.end_headers()
@@ -514,30 +659,23 @@ def make_handler(logs_glob):
 
             paths, recs = load_records(logs_glob)
             requests, responses = group_records(recs)
+            ctx_base = {"paths": paths, "requests": requests, "responses": responses}
+            qs = parse_qs(url.query)
 
-            if path in ("/", "/overview"):
-                self._send(200, render_overview(paths, requests, responses))
-            elif path == "/requests":
-                self._send(200, render_requests(requests, responses,
-                                                (qs.get("agent") or [None])[0]))
-            elif path.startswith("/requests/"):
-                xid = unquote(path[len("/requests/"):])
-                page_html = render_request(xid, requests, responses)
-                if page_html is None:
-                    self._send(404, page("Not found",
-                                         f"<h1>404</h1>"
-                                         f"<p>No request with id "
-                                         f"<code>{esc(xid)}</code></p>"))
-                else:
-                    self._send(200, page_html)
-            elif path.startswith("/skeleton/"):
-                agent = unquote(path[len("/skeleton/"):])
-                self._send(200, render_skeleton(agent, requests))
-            elif path.startswith("/tools/"):
-                agent = unquote(path[len("/tools/"):])
-                self._send(200, render_tools(agent, requests))
-            else:
-                self._send(404, page("Not found", "<h1>404</h1>"))
+            result = dispatch(path, qs, ctx_base)
+            if result is None:
+                body = page("Not found", "<h1>404</h1>").encode("utf-8")
+                self._send(404, "text/html; charset=utf-8", body)
+                return
+            status, ctype, body = result
+            self._send(status, ctype, body)
+
+        def _send(self, status, ctype, body):
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
     return Handler
 
