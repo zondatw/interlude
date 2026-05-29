@@ -29,6 +29,7 @@ import statistics
 import sys
 import threading
 from collections import defaultdict
+from datetime import datetime
 from urllib.parse import parse_qs, unquote, urlparse
 
 from analyze import skeleton, system_text, tool_names, tool_schema_key
@@ -146,6 +147,54 @@ def _usage_cells(usage):
     return i_tok, o_tok, cached
 
 
+def _parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _fmt_gap(seconds):
+    """Format a time delta for the timeline. Negative inputs would only occur
+    on clock skew between log files; render as a leading minus and keep going."""
+    if seconds is None:
+        return ""
+    sign = "+"
+    if seconds < 0:
+        sign = "−"
+        seconds = -seconds
+    if seconds < 1:
+        return f"{sign}{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{sign}{seconds:.1f}s"
+    if seconds < 3600:
+        return f"{sign}{int(seconds // 60)}m {int(seconds % 60)}s"
+    if seconds < 86400:
+        return f"{sign}{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
+    return f"{sign}{int(seconds // 86400)}d"
+
+
+def _build_request_detail(r):
+    """Project a raw request record into the dict shape used by the request
+    detail view and the timeline expansion."""
+    ex = r.get("extract") or {}
+    sys_text, _ = system_text(r)
+    return {
+        "ts": r.get("ts"),
+        "agent": r.get("agent"),
+        "wire": r.get("wire"),
+        "method": r.get("method"),
+        "path": r.get("path"),
+        "headers_kept": r.get("headers_kept") or {},
+        "system": sys_text,
+        "system_chars": len(sys_text) if sys_text else 0,
+        "tools": ex.get("tools"),
+        "messages": ex.get("messages"),
+    }
+
+
 # =============================================================================
 # MODELS — pure data prep per view. Return JSON-serializable dicts.
 # A view returning None signals 404.
@@ -194,24 +243,10 @@ def model_request(ctx):
     req = next((r for r in ctx["requests"] if r.get("id") == xid), None)
     if not req:
         return None  # → 404
-    resp = ctx["responses"].get(xid)
-    sys_text, _ = system_text(req)
-    ex = req.get("extract") or {}
     return {
         "id": xid,
-        "request": {
-            "ts": req.get("ts"),
-            "agent": req.get("agent"),
-            "wire": req.get("wire"),
-            "method": req.get("method"),
-            "path": req.get("path"),
-            "headers_kept": req.get("headers_kept") or {},
-            "system": sys_text,
-            "system_chars": len(sys_text) if sys_text else 0,
-            "tools": ex.get("tools"),
-            "messages": ex.get("messages"),
-        },
-        "response": resp,  # raw — JSON consumers and renderer share access
+        "request": _build_request_detail(req),
+        "response": ctx["responses"].get(xid),
     }
 
 
@@ -251,6 +286,49 @@ def model_tools(ctx):
             tools, chosen_ts = t, r.get("ts")
             break
     return {"agent": agent, "ts": chosen_ts, "tools": tools or []}
+
+
+def model_timeline(ctx):
+    """Chronological summary of exchanges (oldest first), each with the time
+    gap from the previous one. The JSON twin returns just summaries; the HTML
+    renderer pulls per-row detail straight from ctx for inline expansion so
+    /api/timeline stays compact even when the underlying records are large."""
+    agent_filter = (ctx["qs"].get("agent") or [None])[0]
+    rows = []
+    prev_ts = None
+    for r in sorted(ctx["requests"], key=lambda x: x.get("ts", "")):
+        if agent_filter and r.get("agent") != agent_filter:
+            continue
+        xid = r.get("id")
+        if not xid:
+            continue
+        resp = ctx["responses"].get(xid, {})
+        rc = resp.get("reconstructed") or {}
+        i_tok, o_tok, cached = _usage_cells(rc.get("usage"))
+        ts_parsed = _parse_ts(r.get("ts"))
+        gap_s = None
+        if prev_ts and ts_parsed:
+            gap_s = (ts_parsed - prev_ts).total_seconds()
+        if ts_parsed:
+            prev_ts = ts_parsed
+        ex = r.get("extract") or {}
+        rows.append({
+            "id": xid,
+            "ts": r.get("ts"),
+            "gap_s": gap_s,
+            "agent": r.get("agent"),
+            "wire": r.get("wire"),
+            "method": r.get("method"),
+            "path": r.get("path"),
+            "status": resp.get("status"),
+            "model": rc.get("model") or (r.get("request") or {}).get("model"),
+            "tokens_in": i_tok,
+            "tokens_out": o_tok,
+            "tokens_cached": cached,
+            "msg_count": len(ex.get("messages") or []) if isinstance(ex.get("messages"), list) else 0,
+            "tool_count": len(ex.get("tools") or []) if isinstance(ex.get("tools"), list) else 0,
+        })
+    return {"agent_filter": agent_filter, "count": len(rows), "rows": rows}
 
 
 # =============================================================================
@@ -312,6 +390,55 @@ tr:hover td { background: #fafafa; }
                font-size: 0.85em; line-height: 1.6; }
 .skel-fixed { color: #999; }
 .skel-dyn { background: #fff3a3; padding: 0 2px; border-radius: 2px; color: #222; font-weight: 500; }
+
+/* === timeline view === */
+.tl-controls { display: flex; justify-content: space-between; align-items: center;
+               margin: 1em 0; flex-wrap: wrap; gap: 0.5em; }
+.tl-controls a { color: #06c; text-decoration: none; }
+.tl-controls a:hover { text-decoration: underline; }
+.tl-list { list-style: none; padding: 0; margin: 1em 0; }
+.tl-card { display: flex; gap: 0.8em; padding: 0.25em 0; position: relative; }
+.tl-rail { width: 24px; flex-shrink: 0; position: relative; }
+.tl-rail::before {
+  content: ''; position: absolute;
+  left: 50%; transform: translateX(-50%);
+  top: 0; bottom: -0.5em;
+  width: 2px; background: #e3e6ea;
+}
+.tl-card:first-child .tl-rail::before { top: 1.1em; }
+.tl-card:last-child .tl-rail::before { bottom: auto; height: 1.1em; }
+.tl-marker {
+  position: absolute; left: 50%; top: 1.1em;
+  transform: translate(-50%, -50%);
+  width: 12px; height: 12px; border-radius: 50%;
+  background: #fff; border: 2px solid #999; z-index: 1;
+}
+.tl-card[data-agent="claude"] .tl-marker { border-color: #c8743a; }
+.tl-card[data-agent="codex"] .tl-marker { border-color: #3a78c8; }
+.tl-card-body { flex: 1; padding: 0.45em 0.8em; border-radius: 5px;
+                background: #f9fafb; border: 1px solid #eef0f3; }
+.tl-summary { display: flex; flex-wrap: wrap; gap: 0.5em 0.7em; align-items: baseline;
+              font-size: 0.88em; }
+.tl-ts { color: #777; font-family: ui-monospace, monospace; font-size: 0.78em;
+         min-width: 12em; }
+.tl-gap { color: #999; font-size: 0.78em; min-width: 4.5em; }
+.tl-arrow { color: #999; font-weight: 500; }
+.tl-path { font-weight: 500; }
+.tl-status { padding: 0.05em 0.45em; border-radius: 3px; font-size: 0.82em; }
+.tl-counts, .tl-tokens { font-size: 0.78em; }
+.tl-tokens { margin-left: auto; }
+.tl-detail { margin: 0.5em 0 0; }
+.tl-detail > summary { color: #06c; font-size: 0.85em; padding: 0.15em 0; }
+.tl-detail > summary:hover { text-decoration: underline; }
+.tl-detail-body { padding: 0.6em 0.3em 0.3em; border-top: 1px solid #eef0f3;
+                  margin-top: 0.45em; }
+.tl-detail-body h4 { margin-top: 1em; margin-bottom: 0.2em; }
+
+/* === overview CTA === */
+.ov-cta { display: inline-block; padding: 0.4em 0.9em; margin: 0.4em 0;
+          border-radius: 4px; background: #06c; color: #fff;
+          text-decoration: none; font-weight: 500; }
+.ov-cta:hover { background: #048; }
 """
 
 
@@ -324,6 +451,7 @@ def _nav(json_url=None):
            f'<a href="{esc(json_url)}">{esc(json_url)}</a></span>') if json_url else ""
     return (f'<nav class="nav">'
             f'<a href="/">Overview</a>'
+            f'<a href="/timeline">Timeline</a>'
             f'<a href="/requests">Requests</a>'
             f'{api}'
             f'</nav>')
@@ -374,18 +502,96 @@ def render_json(obj, depth=0):
     return f"<code>{esc(json.dumps(obj))}</code>"
 
 
+def _render_request_detail(req, resp, *, top_h="h2", messages_open=False, text_open=True):
+    """Inner HTML for the bulk of a request detail — headers, system, tools,
+    messages, paired response. Shared by /requests/<id> (top_h='h2') and the
+    timeline expansion (top_h='h4', messages_open=True). The two call sites
+    set messages_open / text_open differently because for behavioral analysis
+    the messages and the model reply are the focal points."""
+    sub_h = "h3" if top_h == "h2" else "h4"
+    out = []
+    if req.get("headers_kept"):
+        out.append(f"<{sub_h}>headers (kept)</{sub_h}>")
+        out.append(render_json(req["headers_kept"]))
+    if req.get("system") is not None:
+        out.append(f"<{top_h}>system <span class='muted'>"
+                   f"({req.get('system_chars', 0)} chars)</span></{top_h}>"
+                   f"<details><summary>full text</summary>"
+                   f"<pre>{esc(req['system'])}</pre></details>")
+    tools = req.get("tools")
+    if isinstance(tools, list):
+        out.append(f"<{top_h}>tools <span class='muted'>({len(tools)})</span></{top_h}>")
+        for t in tools:
+            if not isinstance(t, dict):
+                out.append(f"<details><summary><code>{esc(repr(t))}</code></summary></details>")
+                continue
+            n = (t.get("name") or (t.get("function") or {}).get("name")
+                 or t.get("type") or "<unknown>")
+            out.append(f"<details><summary><code>{esc(n)}</code></summary>"
+                       f"{render_json(t)}</details>")
+    msgs = req.get("messages")
+    if isinstance(msgs, list):
+        out.append(f"<{top_h}>messages <span class='muted'>({len(msgs)})</span></{top_h}>")
+        for i, msg in enumerate(msgs):
+            role = (msg.get("role") if isinstance(msg, dict) else None) or "?"
+            open_attr = " open" if messages_open else ""
+            out.append(f"<details{open_attr}><summary>[{i}] role=<code>{esc(role)}</code></summary>"
+                       f"{render_json(msg)}</details>")
+    out.append(f"<{top_h}>response</{top_h}>")
+    if not resp:
+        out.append("<p class='muted'>(no paired response — the proxy may still "
+                   "be streaming, or this record predates Phase 4)</p>")
+    else:
+        status = resp.get("status")
+        s_class = ("status-ok" if isinstance(status, int) and status < 400
+                   else "status-err")
+        out.append("<dl class='kv'>"
+                   f"<dt>status</dt><dd class='{s_class}'>{esc(status)}</dd>"
+                   f"<dt>stream</dt><dd>{esc(resp.get('stream'))}</dd>"
+                   f"<dt>content-type</dt>"
+                   f"<dd><code>{esc(resp.get('content_type'))}</code></dd>"
+                   "</dl>")
+        rc = resp.get("reconstructed")
+        if rc:
+            out.append(f"<{sub_h}>reassembled</{sub_h}>")
+            if rc.get("model"):
+                out.append(f"<p>model: <code>{esc(rc.get('model'))}</code></p>")
+            if rc.get("text"):
+                text_attr = " open" if text_open else ""
+                out.append(f"<details{text_attr}><summary>text</summary>"
+                           f"<pre>{esc(rc.get('text'))}</pre></details>")
+            if rc.get("tool_uses"):
+                out.append(f"<h4>tool uses</h4>{render_json(rc.get('tool_uses'))}")
+            if rc.get("usage"):
+                out.append(f"<h4>usage</h4>{render_json(rc.get('usage'))}")
+            if resp.get("event_types"):
+                out.append(f"<h4>event_types</h4>{render_json(resp.get('event_types'))}")
+        else:
+            b = resp.get("body")
+            if b is not None:
+                out.append(f"<{sub_h}>body</{sub_h}>")
+                if isinstance(b, str):
+                    out.append(f"<pre>{esc(b)}</pre>")
+                else:
+                    out.append(render_json(b))
+    return "".join(out)
+
+
 # =============================================================================
 # RENDERERS — pure model dict -> HTML string
 # =============================================================================
 
 
-def render_overview(m):
+def render_overview(m, ctx=None):
     body = ["<h1>Interlude</h1>",
             "<p class='muted'>"
             f"{len(m['files'])} log file(s) · "
             f"{m['request_count']} request record(s) · "
             f"{m['response_count']} response record(s)"
-            "</p>"]
+            "</p>",
+            "<p><a class='ov-cta' href='/timeline'>▶ Open timeline</a> "
+            "<span class='muted'>— chronological exchanges, click any card to "
+            "expand its system / tools / messages / response inline</span></p>"]
     facts = m["agents"]
     if not facts:
         body.append("<p>No analyzable records yet. Start the proxy "
@@ -417,7 +623,7 @@ def render_overview(m):
     return page("Overview", "".join(body), json_url="/api/")
 
 
-def render_requests(m):
+def render_requests(m, ctx=None):
     body = ["<h1>Requests</h1>",
             "<p class='muted'>"
             "<a href='/requests'>all</a> · "
@@ -451,7 +657,7 @@ def render_requests(m):
     return page("Requests", "".join(body), json_url=json_url)
 
 
-def render_request(m):
+def render_request(m, ctx=None):
     req = m["request"]
     resp = m["response"]
     body = [f"<h1>Request <code>{esc(m['id'])}</code></h1>",
@@ -459,81 +665,12 @@ def render_request(m):
     for k in ("ts", "agent", "wire", "method", "path"):
         body.append(f"<dt>{esc(k)}</dt><dd><code>{esc(req.get(k, ''))}</code></dd>")
     body.append("</dl>")
-
-    if req["headers_kept"]:
-        body.append("<h3>headers (kept)</h3>")
-        body.append(render_json(req["headers_kept"]))
-
-    if req["system"] is not None:
-        body.append(f"<h2>system <span class='muted'>"
-                    f"({req['system_chars']} chars)</span></h2>"
-                    f"<details><summary>full text</summary>"
-                    f"<pre>{esc(req['system'])}</pre></details>")
-
-    tools = req["tools"]
-    if isinstance(tools, list):
-        body.append(f"<h2>tools <span class='muted'>({len(tools)})</span></h2>")
-        for t in tools:
-            if not isinstance(t, dict):
-                body.append(f"<details><summary><code>{esc(repr(t))}</code></summary></details>")
-                continue
-            n = (t.get("name")
-                 or (t.get("function") or {}).get("name")
-                 or t.get("type")
-                 or "<unknown>")
-            body.append(f"<details><summary><code>{esc(n)}</code></summary>"
-                        f"{render_json(t)}</details>")
-
-    msgs = req["messages"]
-    if isinstance(msgs, list):
-        body.append(f"<h2>messages <span class='muted'>({len(msgs)})</span></h2>")
-        for i, msg in enumerate(msgs):
-            role = (msg.get("role") if isinstance(msg, dict) else None) or "?"
-            body.append(f"<details><summary>[{i}] role=<code>{esc(role)}</code></summary>"
-                        f"{render_json(msg)}</details>")
-
-    body.append("<h2>response</h2>")
-    if not resp:
-        body.append("<p class='muted'>(no paired response — the proxy may still "
-                    "be streaming, or this record predates Phase 4)</p>")
-    else:
-        status = resp.get("status")
-        s_class = ("status-ok"
-                   if isinstance(status, int) and status < 400
-                   else "status-err")
-        body.append("<dl class='kv'>"
-                    f"<dt>status</dt><dd class='{s_class}'>{esc(status)}</dd>"
-                    f"<dt>stream</dt><dd>{esc(resp.get('stream'))}</dd>"
-                    f"<dt>content-type</dt>"
-                    f"<dd><code>{esc(resp.get('content_type'))}</code></dd>"
-                    "</dl>")
-        rc = resp.get("reconstructed")
-        if rc:
-            body.append("<h3>reassembled</h3>")
-            if rc.get("model"):
-                body.append(f"<p>model: <code>{esc(rc.get('model'))}</code></p>")
-            if rc.get("text"):
-                body.append("<details open><summary>text</summary>"
-                            f"<pre>{esc(rc.get('text'))}</pre></details>")
-            if rc.get("tool_uses"):
-                body.append(f"<h4>tool uses</h4>{render_json(rc.get('tool_uses'))}")
-            if rc.get("usage"):
-                body.append(f"<h4>usage</h4>{render_json(rc.get('usage'))}")
-            if resp.get("event_types"):
-                body.append(f"<h4>event_types</h4>{render_json(resp.get('event_types'))}")
-        else:
-            b = resp.get("body")
-            if b is not None:
-                body.append("<h3>body</h3>")
-                if isinstance(b, str):
-                    body.append(f"<pre>{esc(b)}</pre>")
-                else:
-                    body.append(render_json(b))
+    body.append(_render_request_detail(req, resp, top_h="h2"))
     return page(f"Request {m['id']}", "".join(body),
                 json_url=f"/api/requests/{m['id']}")
 
 
-def render_skeleton(m):
+def render_skeleton(m, ctx=None):
     agent = m["agent"]
     body = [f"<h1>Skeleton vs slots · "
             f"<span class='tag {esc(agent)}'>{esc(agent)}</span></h1>"]
@@ -569,7 +706,7 @@ def render_skeleton(m):
                 json_url=f"/api/skeleton/{agent}")
 
 
-def render_tools(m):
+def render_tools(m, ctx=None):
     agent = m["agent"]
     body = [f"<h1>Tools · <span class='tag {esc(agent)}'>{esc(agent)}</span></h1>"]
     if not m["tools"]:
@@ -591,18 +728,79 @@ def render_tools(m):
                 json_url=f"/api/tools/{agent}")
 
 
+def render_timeline(m, ctx=None):
+    json_url = ("/api/timeline?agent=" + m["agent_filter"]
+                if m["agent_filter"] else "/api/timeline")
+    body = ["<h1>Timeline</h1>",
+            "<header class='tl-controls'>"
+            "<span>Filter: <a href='/timeline'>all</a> · "
+            "<a href='/timeline?agent=claude'>claude</a> · "
+            "<a href='/timeline?agent=codex'>codex</a></span>"
+            f"<span class='muted'>{m['count']} exchange(s) · oldest first</span>"
+            "</header>"]
+    if not m["rows"]:
+        body.append("<p class='muted'>(no exchanges matched — capture some "
+                    "traffic, or relax the filter)</p>")
+        return page("Timeline", "".join(body), json_url=json_url)
+
+    # Build an id → raw-record index so inline expansion is O(1) per row even
+    # as the log set grows.
+    by_id = {r.get("id"): r for r in (ctx or {}).get("requests", [])}
+    responses = (ctx or {}).get("responses", {})
+
+    body.append("<ol class='tl-list'>")
+    for row in m["rows"]:
+        gap = _fmt_gap(row["gap_s"])
+        status = row["status"]
+        s_class = ("status-ok" if isinstance(status, int) and status < 400
+                   else "status-err")
+        agent = row["agent"] or "?"
+        raw = by_id.get(row["id"])
+        det_req = _build_request_detail(raw) if raw else {}
+        resp = responses.get(row["id"])
+        body.append(
+            f"<li class='tl-card' data-agent='{esc(agent)}'>"
+            f"<div class='tl-rail'><span class='tl-marker'></span></div>"
+            f"<div class='tl-card-body'>"
+            f"<header class='tl-summary'>"
+            f"<time class='tl-ts'>{esc(row['ts'])}</time>"
+            f"<span class='tl-gap'>{esc(gap)}</span>"
+            f"<span class='tag {esc(agent)}'>{esc(agent)}</span>"
+            f"<span class='tl-arrow'>→</span>"
+            f"<code class='tl-path'>{esc(row['method'] or '')} {esc(row['path'] or '')}</code>"
+            f"<span class='tl-status {s_class}'>{esc(status) if status is not None else '—'}</span>"
+            f"<span class='tl-counts muted'>msgs:{row['msg_count']} · tools:{row['tool_count']}</span>"
+            f"<span class='tl-tokens muted'>"
+            f"{esc(row['tokens_in']) if row['tokens_in'] is not None else '—'} in · "
+            f"{esc(row['tokens_out']) if row['tokens_out'] is not None else '—'} out · "
+            f"{esc(row['tokens_cached']) if row['tokens_cached'] is not None else '—'} cached"
+            f"</span>"
+            f"</header>"
+            f"<details class='tl-detail'>"
+            f"<summary>▸ expand "
+            f"(<a href='/requests/{esc(row['id'])}'>open page</a>)</summary>"
+            f"<div class='tl-detail-body'>"
+            f"{_render_request_detail(det_req, resp, top_h='h4', messages_open=True)}"
+            f"</div></details>"
+            f"</div></li>"
+        )
+    body.append("</ol>")
+    return page("Timeline", "".join(body), json_url=json_url)
+
+
 # =============================================================================
 # ROUTING — one table, twin /api JSON via prefix strip
 # =============================================================================
 
 
 ROUTES = [
-    # (regex,                                                model,         renderer)
-    (re.compile(r"^/$"),                                    model_overview, render_overview),
-    (re.compile(r"^/requests$"),                            model_requests, render_requests),
-    (re.compile(r"^/requests/(?P<xid>[0-9a-f]+)$"),         model_request,  render_request),
-    (re.compile(r"^/skeleton/(?P<agent>[a-zA-Z0-9_-]+)$"),  model_skeleton, render_skeleton),
-    (re.compile(r"^/tools/(?P<agent>[a-zA-Z0-9_-]+)$"),     model_tools,    render_tools),
+    # (regex,                                                model,          renderer)
+    (re.compile(r"^/$"),                                    model_overview,  render_overview),
+    (re.compile(r"^/timeline$"),                            model_timeline,  render_timeline),
+    (re.compile(r"^/requests$"),                            model_requests,  render_requests),
+    (re.compile(r"^/requests/(?P<xid>[0-9a-f]+)$"),         model_request,   render_request),
+    (re.compile(r"^/skeleton/(?P<agent>[a-zA-Z0-9_-]+)$"),  model_skeleton,  render_skeleton),
+    (re.compile(r"^/tools/(?P<agent>[a-zA-Z0-9_-]+)$"),     model_tools,     render_tools),
 ]
 
 
@@ -635,7 +833,7 @@ def dispatch(url_path, qs, ctx_base):
         if json_mode:
             data = json.dumps(model, ensure_ascii=False, default=str).encode("utf-8")
             return 200, "application/json", data
-        return 200, "text/html; charset=utf-8", render_fn(model).encode("utf-8")
+        return 200, "text/html; charset=utf-8", render_fn(model, ctx).encode("utf-8")
     return None
 
 
