@@ -515,6 +515,35 @@ def model_timeline(ctx):
     hour_buckets = [{"hour": h, "count": c}
                     for h, c in sorted(bucket_counts.items())]
 
+    # --- Token usage series (per-call + cumulative) -------------------------
+    # Build the time series from "in" events (tokens are only known once the
+    # response was reassembled). Each point carries the per-call breakdown
+    # AND the running total so the chart can show both at once.
+    tokens_series = []
+    running = 0
+    for ev in events:
+        if ev["dir"] != "in":
+            continue
+        in_t = ev.get("tokens_in") or 0
+        out_t = ev.get("tokens_out") or 0
+        cached_t = ev.get("tokens_cached") or 0
+        if not isinstance(in_t, int):
+            in_t = 0
+        if not isinstance(out_t, int):
+            out_t = 0
+        if not isinstance(cached_t, int):
+            cached_t = 0
+        total = in_t + out_t
+        running += total
+        tokens_series.append({
+            "id": ev["id"], "ts": ev["ts"],
+            "in": in_t, "out": out_t, "cached": cached_t,
+            "total": total, "cumulative": running,
+            "session_id": ev.get("session_id"),
+            "agent": ev.get("agent"),
+        })
+    tokens_total = running
+
     return {
         "agent_filter": agent_filter,
         "form": {
@@ -529,6 +558,8 @@ def model_timeline(ctx):
         "session_gap_s": session_gap_s,
         "sessions": sessions,
         "hour_buckets": hour_buckets,
+        "tokens_series": tokens_series,
+        "tokens_total": tokens_total,
         "exchanges": exchanges,
         "event_count": len(events),
         "events": events,
@@ -694,6 +725,44 @@ tr:hover td { background: #fafafa; }
   min-width: 2px;
 }
 .seq-rtt-label { font-size: 0.75em; font-family: ui-monospace, monospace; }
+
+/* --- token usage chart --- */
+.seq-tokens {
+  margin: 0.8em 0 1em;
+  padding: 0.7em 0.9em;
+  background: #fafbfc;
+  border: 1px solid #eef0f3;
+  border-radius: 5px;
+}
+.seq-tokens-title {
+  display: flex; justify-content: space-between; align-items: center;
+  flex-wrap: wrap; gap: 0.3em 0.6em;
+  font-size: 0.78em; margin: 0.3em 0 0.2em;
+}
+.seq-tokens-title:first-child { margin-top: 0; }
+.seq-tokens-legend {
+  display: inline-flex; align-items: center; gap: 0.3em 0.7em;
+  flex-wrap: wrap; font-size: 0.78em; color: #555;
+}
+.seq-tokens-legend .dot {
+  display: inline-block; width: 0.7em; height: 0.7em; border-radius: 2px;
+  vertical-align: -1px; margin-right: 0.1em;
+}
+.seq-tokens-legend .dot-in     { background: #5a9c4f; }
+.seq-tokens-legend .dot-cached { background: #b8b8c0; }
+.seq-tokens-legend .dot-out    { background: #3a78c8; }
+.seq-tokens-svg {
+  width: 100%; height: 90px;
+  background: #fff;
+  border: 1px solid #eef0f3;
+  border-radius: 3px;
+  display: block;
+}
+.seq-tokens-axis {
+  display: flex; justify-content: space-between;
+  font-family: ui-monospace, monospace; font-size: 0.72em;
+  margin-top: 0.3em;
+}
 
 .seq { margin: 1em 0; }
 
@@ -864,6 +933,118 @@ def render_json(obj, depth=0):
                     f"<pre>{esc(obj)}</pre></details>")
         return f"<code>{esc(json.dumps(obj))}</code>"
     return f"<code>{esc(json.dumps(obj))}</code>"
+
+
+def _render_tokens_chart(tokens_series):
+    """SVG chart of token usage over time: stacked per-call bars on top
+    (input - cached / cached / output) + cumulative running total below.
+    Both panels are time-positioned across the same x range so a tall bar
+    lines up with the matching step in the cumulative curve."""
+    if not tokens_series:
+        return ""
+    parsed = [(p, _parse_ts(p["ts"])) for p in tokens_series]
+    parsed = [(p, t) for p, t in parsed if t is not None]
+    if not parsed:
+        return ""
+
+    if len(parsed) == 1:
+        only = parsed[0][0]
+        return (
+            f"<div class='seq-tokens'>"
+            f"<div class='seq-tokens-title muted'>tokens</div>"
+            f"<p class='muted'>only one data point: "
+            f"{only['in']:,} in / {only['out']:,} out / "
+            f"{only['cached']:,} cached</p>"
+            f"</div>"
+        )
+
+    min_ts = min(t for _, t in parsed)
+    max_ts = max(t for _, t in parsed)
+    span = (max_ts - min_ts).total_seconds() or 1.0
+    max_call = max(p["total"] for p, _ in parsed) or 1
+    max_cum = parsed[-1][0]["cumulative"] or 1
+    cum_total = parsed[-1][0]["cumulative"]
+
+    W, H_BAR, H_CUM = 1000, 90, 90
+    bar_w = max(2, min(10, W / max(1, len(parsed))))
+
+    # Per-call stacked bars: in_only on top, cached in middle, output at bottom
+    # (visually clearer than billing-order; reads as "billed prompt / cached /
+    # generation" since they live in a single bar). Order chosen so cached
+    # sits between input and output, matching how a reader skims the cost.
+    bars = []
+    for p, t in parsed:
+        x = (t - min_ts).total_seconds() / span * (W - bar_w)
+        total = p["total"]
+        if total <= 0:
+            # Mark zero-token events with a tiny tick so retries are visible
+            bars.append(f"<line x1='{x:.1f}' y1='{H_BAR-1}' x2='{x + bar_w:.1f}' "
+                        f"y2='{H_BAR-1}' stroke='#c33' stroke-width='1.5' "
+                        f"opacity='0.5'/>")
+            continue
+        h_total = (total / max_call) * H_BAR
+        # Stack (top → bottom): in_only, cached, out
+        in_only = max(0, p["in"] - p["cached"])
+        cached = p["cached"]
+        out = p["out"]
+        denom = in_only + cached + out or 1
+        h_in     = (in_only / denom) * h_total
+        h_cached = (cached  / denom) * h_total
+        h_out    = (out     / denom) * h_total
+        y0 = H_BAR - h_total
+        bars.append(f"<rect x='{x:.1f}' y='{y0:.2f}' width='{bar_w:.1f}' "
+                    f"height='{h_in:.2f}' fill='#5a9c4f'/>")
+        bars.append(f"<rect x='{x:.1f}' y='{(y0 + h_in):.2f}' width='{bar_w:.1f}' "
+                    f"height='{h_cached:.2f}' fill='#b8b8c0'/>")
+        bars.append(f"<rect x='{x:.1f}' y='{(y0 + h_in + h_cached):.2f}' "
+                    f"width='{bar_w:.1f}' height='{h_out:.2f}' fill='#3a78c8'/>")
+
+    # Cumulative line as a step path (tokens jump at the moment they land)
+    pts = ["0," + f"{H_CUM}"]
+    last_y = H_CUM
+    for p, t in parsed:
+        x = (t - min_ts).total_seconds() / span * W
+        y = H_CUM - (p["cumulative"] / max_cum) * H_CUM
+        pts.append(f"{x:.1f},{last_y:.2f}")
+        pts.append(f"{x:.1f},{y:.2f}")
+        last_y = y
+    pts.append(f"{W},{last_y:.2f}")
+    poly = " ".join(pts)
+
+    start_lbl = min_ts.strftime("%Y-%m-%d %H:%M:%S")
+    end_lbl   = max_ts.strftime("%Y-%m-%d %H:%M:%S")
+
+    return (
+        "<div class='seq-tokens'>"
+        f"<div class='seq-tokens-title'>"
+        f"<span class='muted'>tokens per call</span> "
+        f"<span class='seq-tokens-legend'>"
+        f"<span class='dot dot-in'></span> input(billable) "
+        f"<span class='dot dot-cached'></span> cached "
+        f"<span class='dot dot-out'></span> output "
+        f"<span class='muted'>· max {max_call:,}</span>"
+        f"</span>"
+        f"</div>"
+        f"<svg viewBox='0 0 {W} {H_BAR + 2}' preserveAspectRatio='none' "
+        f"class='seq-tokens-svg'>"
+        f"{''.join(bars)}"
+        f"</svg>"
+        f"<div class='seq-tokens-title'>"
+        f"<span class='muted'>cumulative</span> "
+        f"<span class='muted'>· total {cum_total:,} tokens</span>"
+        f"</div>"
+        f"<svg viewBox='0 0 {W} {H_CUM + 2}' preserveAspectRatio='none' "
+        f"class='seq-tokens-svg'>"
+        f"<polygon points='{poly}' fill='#3a78c8' fill-opacity='0.12' "
+        f"stroke='none'/>"
+        f"<polyline points='{poly}' fill='none' stroke='#3a78c8' "
+        f"stroke-width='2'/>"
+        f"</svg>"
+        f"<div class='seq-tokens-axis muted'>"
+        f"<span>{esc(start_lbl)}</span><span>{esc(end_lbl)}</span>"
+        f"</div>"
+        f"</div>"
+    )
 
 
 def _render_request_detail(req, resp, *, top_h="h2", messages_open=False,
@@ -1184,6 +1365,9 @@ def render_timeline(m, ctx=None):
                 f"</a>"
             )
         body.append("</div>")
+
+    # --- Token usage chart (per-call stacked bars + cumulative line) --------
+    body.append(_render_tokens_chart(m["tokens_series"]))
 
     if not m["events"]:
         body.append("<p class='muted'>(no exchanges matched — capture some "
