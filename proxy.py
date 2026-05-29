@@ -387,6 +387,8 @@ def main():
         print(f"[interlude] {label}: http://127.0.0.1:{port} -> https://{host}",
               flush=True)
     print(f"[interlude] logging to {LOG_PATH}", flush=True)
+    print(f"[interlude] web UI:  uv run report.py serve  ->  "
+          f"http://127.0.0.1:8000/timeline", flush=True)
 
     try:
         while True:
