@@ -153,6 +153,34 @@ uv run analyze.py path/to/log.jsonl  # 指定檔 / glob
 > 想讓 Codex 的動態插槽浮現，需跑幾個**不同 prompt / 不同時間**的 session（同一個 prompt
 > 的多次 retry 都是同一份 system，只會算成 1 個 distinct 樣本）。
 
+## Web UI
+
+想用瀏覽器逐筆瀏覽、看「動態插槽」黃底高亮在原文裡的位置、展開 tool schema——
+起本地 web UI：
+
+```bash
+uv run report.py serve                  # http://127.0.0.1:8000（預設）
+uv run report.py serve --port 9000
+uv run report.py serve --logs "other/path/log-*.jsonl"
+```
+
+路由：
+
+| 路徑 | 內容 |
+|---|---|
+| `/` | 跨 agent 比較表 + 每個 agent 關鍵數字 |
+| `/requests[?agent=…]` | 全部 exchange 列表，可依 agent 過濾，含 model / token 欄位 |
+| `/requests/<id>` | 單筆完整：system / tools / messages 摺疊 + 配對好的重組回應 |
+| `/skeleton/<agent>` | canonical sample，**固定行灰、動態插槽行黃底**；底下列所有動態行 |
+| `/tools/<agent>` | 每個 tool 的 JSON schema 可展開 |
+
+每個 HTML 頁面都有對應的 `/api/<同路徑>` 端點，回相同資料的 JSON——一開始就內建好，
+之後做 token usage 圖表 / 搜尋過濾 / live update 直接吃這個 endpoint，不必回頭剝
+HTML。每頁 nav 都有 JSON 連結方便發現。
+
+**只綁 `127.0.0.1`**（log 含完整 prompt，絕不能 LAN 可達）。loader 用 mtime cache，
+proxy 邊 append 邊讀也不會慢；F5 reload 就看到新資料。
+
 ## 一鍵端到端驗證
 
 ```bash
@@ -250,6 +278,7 @@ uv run analyze.py
 | 檔 | 用途 |
 |---|---|
 | `proxy.py` | 三 listener reverse proxy，streaming relay + SSE tee/重組 |
-| `analyze.py` | 跨請求 diff、固定骨幹 vs 動態插槽、跨 agent 比較 |
+| `analyze.py` | 跨請求 diff、固定骨幹 vs 動態插槽、跨 agent 比較（純文字報告） |
+| `report.py` | 本地 web UI（HTML + JSON），對應同樣的分析 |
 | `dogfood.sh` | 一鍵端到端驗證 |
 | `.interlude/` | JSONL 輸出（gitignored，敏感） |

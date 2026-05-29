@@ -166,6 +166,37 @@ The report covers:
 > at different times** (multiple retries of the same prompt share one system
 > prompt and count as just 1 distinct sample).
 
+## Web UI
+
+For a browseable view of the same data — with per-request drill-in,
+skeleton-vs-slot highlighting in context, and a tools schema browser —
+launch the local web UI:
+
+```bash
+uv run report.py serve                  # http://127.0.0.1:8000 (default)
+uv run report.py serve --port 9000
+uv run report.py serve --logs "other/path/log-*.jsonl"
+```
+
+Routes:
+
+| Path | What it shows |
+|---|---|
+| `/` | Cross-agent overview + per-agent stats |
+| `/requests[?agent=…]` | Sortable list of exchanges with model / token columns |
+| `/requests/<id>` | Collapsible system / tools / messages + paired reassembled response |
+| `/skeleton/<agent>` | Canonical system sample with fixed lines greyed and dynamic slots highlighted in yellow |
+| `/tools/<agent>` | Collapsible JSON schema per tool |
+
+Every HTML page has a matching `/api/<same path>` endpoint that returns the
+same data as JSON — built in from day one so future features (token usage
+charts, search/filter, live update) consume a stable backend instead of
+re-scraping HTML. The page nav surfaces the JSON URL on every view.
+
+Bound to `127.0.0.1` only (the logs hold full prompts; never expose them on
+LAN). The JSONL loader is mtime-cached, so re-reads stay cheap while the
+proxy keeps appending — just refresh the page to see new captures.
+
 ## One-command end-to-end verification
 
 ```bash
@@ -273,6 +304,7 @@ field normalization in `extract()` (requests) and `reconstruct()` (responses).
 | File | Purpose |
 |---|---|
 | `proxy.py` | Three-listener reverse proxy, streaming relay + SSE tee/reassembly |
-| `analyze.py` | Cross-request diff, fixed skeleton vs. dynamic slots, cross-agent comparison |
+| `analyze.py` | Cross-request diff, fixed skeleton vs. dynamic slots, cross-agent comparison (text report) |
+| `report.py` | Local web UI (HTML + JSON) over the same analysis |
 | `dogfood.sh` | One-command end-to-end verification |
 | `.interlude/` | JSONL output (gitignored, sensitive) |
