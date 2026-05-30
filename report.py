@@ -18,6 +18,7 @@ re-scraping HTML.
 """
 
 import argparse
+import difflib
 import glob
 import hashlib
 import html
@@ -310,6 +311,83 @@ def _make_snippet(text, query, context=40):
     }
 
 
+def _diff_lines(a_text, b_text, n=3):
+    """Unified line diff as a list of {type, text} dicts. type is one of
+    'context' | 'add' | 'remove' | 'hunk' | 'header'. Empty result means
+    identical."""
+    a_lines = (a_text or "").splitlines()
+    b_lines = (b_text or "").splitlines()
+    out = []
+    for line in difflib.unified_diff(a_lines, b_lines, lineterm="", n=n):
+        if line.startswith("---") or line.startswith("+++"):
+            out.append({"type": "header", "text": line})
+        elif line.startswith("@@"):
+            out.append({"type": "hunk", "text": line})
+        elif line.startswith("+"):
+            out.append({"type": "add", "text": line[1:]})
+        elif line.startswith("-"):
+            out.append({"type": "remove", "text": line[1:]})
+        else:
+            text = line[1:] if line.startswith(" ") else line
+            out.append({"type": "context", "text": text})
+    return out
+
+
+def _diff_tools(tools_a, tools_b):
+    """Compare two tool lists by name. Returns {added, removed, changed,
+    a_total, b_total}. 'changed' means same name, different serialized JSON
+    (schema or description differs)."""
+    def by_name(tools):
+        if not isinstance(tools, list):
+            return {}
+        d = {}
+        for t in tools:
+            if isinstance(t, dict):
+                n = (t.get("name")
+                     or (t.get("function") or {}).get("name")
+                     or t.get("type"))
+                if n:
+                    d[n] = t
+        return d
+    a_map = by_name(tools_a)
+    b_map = by_name(tools_b)
+    added = sorted(set(b_map) - set(a_map))
+    removed = sorted(set(a_map) - set(b_map))
+    changed = []
+    for n in sorted(set(a_map) & set(b_map)):
+        if (json.dumps(a_map[n], sort_keys=True)
+                != json.dumps(b_map[n], sort_keys=True)):
+            changed.append(n)
+    return {
+        "added": added, "removed": removed, "changed": changed,
+        "a_total": len(a_map), "b_total": len(b_map),
+    }
+
+
+def _diff_messages(msgs_a, msgs_b):
+    """Find the common prefix between two messages arrays and return the
+    diverging tails. Conversations grow by appending, so this exposes
+    'A and B agreed up to turn N, then diverged'."""
+    if not isinstance(msgs_a, list):
+        msgs_a = []
+    if not isinstance(msgs_b, list):
+        msgs_b = []
+    prefix = 0
+    for i in range(min(len(msgs_a), len(msgs_b))):
+        if (json.dumps(msgs_a[i], sort_keys=True, ensure_ascii=False)
+                == json.dumps(msgs_b[i], sort_keys=True, ensure_ascii=False)):
+            prefix += 1
+        else:
+            break
+    return {
+        "common_prefix": prefix,
+        "a_total": len(msgs_a),
+        "b_total": len(msgs_b),
+        "a_tail": msgs_a[prefix:],
+        "b_tail": msgs_b[prefix:],
+    }
+
+
 def _build_request_detail(r):
     """Project a raw request record into the dict shape used by the request
     detail view and the timeline expansion."""
@@ -438,6 +516,63 @@ def _upstream_label(wire, path):
     if wire == "codex-chat":
         return "OpenAI"
     return "API"
+
+
+def model_diff(ctx):
+    """Diff two exchanges (a vs b) across system / tools / messages. Returns
+    a 'state' field so the renderer can show:
+    - 'need_input' : a or b not in URL — render a picker form
+    - 'not_found'  : one of the ids does not exist — render an error with the
+                     missing id called out
+    - 'ok'         : both found — render the actual diff."""
+    a_id = ((ctx["qs"].get("a") or [""])[0]).strip()
+    b_id = ((ctx["qs"].get("b") or [""])[0]).strip()
+    if not (a_id and b_id):
+        return {"state": "need_input", "a_id": a_id, "b_id": b_id}
+
+    by_id = {r.get("id"): r for r in ctx["requests"]}
+    req_a = by_id.get(a_id)
+    req_b = by_id.get(b_id)
+    if not req_a or not req_b:
+        return {"state": "not_found", "a_id": a_id, "b_id": b_id,
+                "a_found": req_a is not None, "b_found": req_b is not None}
+
+    resp_a = ctx["responses"].get(a_id)
+    resp_b = ctx["responses"].get(b_id)
+    sys_a, _ = system_text(req_a)
+    sys_b, _ = system_text(req_b)
+    tools_a = (req_a.get("extract") or {}).get("tools")
+    tools_b = (req_b.get("extract") or {}).get("tools")
+    msgs_a = (req_a.get("extract") or {}).get("messages")
+    msgs_b = (req_b.get("extract") or {}).get("messages")
+
+    def _meta(req, resp):
+        rc = (resp or {}).get("reconstructed") or {}
+        return {
+            "id": req.get("id"),
+            "ts": req.get("ts"),
+            "agent": req.get("agent"),
+            "wire": req.get("wire"),
+            "method": req.get("method"),
+            "path": req.get("path"),
+            "status": (resp or {}).get("status"),
+            "model": rc.get("model")
+                     or (req.get("request") or {}).get("model"),
+        }
+
+    return {
+        "state": "ok",
+        "a": _meta(req_a, resp_a),
+        "b": _meta(req_b, resp_b),
+        "system": {
+            "diff": _diff_lines(sys_a or "", sys_b or ""),
+            "a_chars": len(sys_a or ""),
+            "b_chars": len(sys_b or ""),
+            "identical": (sys_a or "") == (sys_b or ""),
+        },
+        "tools": _diff_tools(tools_a, tools_b),
+        "messages": _diff_messages(msgs_a, msgs_b),
+    }
 
 
 def model_timeline(ctx):
@@ -872,6 +1007,64 @@ tr:hover td { background: #fafafa; }
   margin-top: 0.3em;
 }
 
+/* --- /diff view --- */
+.diff-meta { width: auto; border-collapse: collapse; margin: 0.7em 0 1em; }
+.diff-meta th, .diff-meta td { padding: 0.3em 0.7em; font-size: 0.86em;
+                                border-bottom: 1px solid #eee; }
+.diff-meta th { background: #f7f7f9; font-weight: 600; }
+.diff-block { font-family: ui-monospace, monospace; font-size: 0.83em;
+              max-height: 640px; overflow: auto; line-height: 1.5;
+              padding: 0.6em 0.8em; border: 1px solid #eaecef; border-radius: 4px;
+              background: #fdfdfe; }
+.diff-block span { display: block; padding: 0 0.2em; white-space: pre-wrap;
+                   word-break: break-all; }
+.diff-add     { background: #e6ffed; color: #22863a; }
+.diff-add::before    { content: "+ "; opacity: 0.7; }
+.diff-remove  { background: #ffeef0; color: #b31d28; }
+.diff-remove::before { content: "- "; opacity: 0.7; }
+.diff-hunk    { background: #f1eafe; color: #6f42c1; }
+.diff-header  { background: #f7f7f9; color: #555; }
+.diff-context { color: #6a737d; }
+.diff-context::before { content: "  "; opacity: 0; }
+.diff-legend {
+  display: flex; flex-wrap: wrap; gap: 0.4em;
+  margin: 0.4em 0 0.6em; font-size: 0.78em;
+}
+.diff-legend-key {
+  padding: 0.18em 0.55em; border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  border: 1px solid rgba(0,0,0,0.06);
+}
+.diff-legend-key.diff-context { background: #f6f8fa; color: #555; }
+/* Suppress the automatic +/- prefix on the chips so the explicit symbols in
+   the chip text are not doubled up. */
+.diff-legend-key::before { content: ""; }
+
+.diff-msg-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
+.diff-msg-cols > div { padding: 0.5em 0.7em; background: #fafbfc;
+                       border: 1px solid #eef0f3; border-radius: 4px; }
+.diff-msg-cols h3 { margin-top: 0; font-size: 0.95em; }
+.diff-picker {
+  display: flex; flex-wrap: wrap; align-items: end; gap: 0.6em 0.9em;
+  padding: 0.7em 0.9em; background: #f7f8fa;
+  border: 1px solid #eef0f3; border-radius: 5px; margin: 0.6em 0;
+}
+.diff-picker label {
+  display: flex; flex-direction: column; gap: 0.2em;
+  font-size: 0.78em; color: #555; font-weight: 500;
+}
+.diff-picker input { font-size: 0.88em; padding: 0.3em 0.45em;
+                     border: 1px solid #d0d6dd; border-radius: 3px;
+                     font-family: ui-monospace, monospace; }
+.diff-picker button { padding: 0.4em 1em; background: #06c; color: #fff;
+                      border: 0; border-radius: 3px; font-weight: 500;
+                      cursor: pointer; font-size: 0.9em; }
+.diff-picker button:hover { background: #048; }
+.diff-picker-list { list-style: none; padding: 0; }
+.diff-picker-list li { padding: 0.3em 0; border-bottom: 1px solid #f0f0f0;
+                       font-size: 0.85em; }
+.diff-picker-list code { font-size: 0.82em; }
+
 .seq { margin: 1em 0; }
 
 /* The lanes header and every event row share the same 5-column template so
@@ -994,6 +1187,7 @@ def _nav(json_url=None):
             f'<a href="/">Overview</a>'
             f'<a href="/timeline">Timeline</a>'
             f'<a href="/requests">Requests</a>'
+            f'<a href="/diff">Diff</a>'
             f'{api}'
             f'</nav>')
 
@@ -1391,6 +1585,169 @@ def render_tools(m, ctx=None):
                 json_url=f"/api/tools/{agent}")
 
 
+def render_diff(m, ctx=None):
+    a_id = m.get("a_id") or (m.get("a") or {}).get("id") or ""
+    b_id = m.get("b_id") or (m.get("b") or {}).get("id") or ""
+    json_url = (f"/api/diff?a={quote_plus(a_id)}&b={quote_plus(b_id)}"
+                if a_id and b_id else "/api/diff")
+
+    if m["state"] == "need_input":
+        recent_picker = []
+        if ctx and ctx.get("requests"):
+            recent = sorted(ctx["requests"], key=lambda r: r.get("ts", ""),
+                            reverse=True)[:25]
+            for r in recent:
+                rid = r.get("id") or ""
+                recent_picker.append(
+                    f"<li><code>{esc(rid)}</code> "
+                    f"<span class='tag {esc(r.get('agent', ''))}'>"
+                    f"{esc(r.get('agent', ''))}</span> "
+                    f"<span class='muted'>{esc(r.get('ts', ''))}</span> "
+                    f"<code>{esc(r.get('path', ''))}</code> "
+                    f"<a href='/diff?a={quote_plus(rid)}&b={quote_plus(b_id)}'>"
+                    f"set as A</a> · "
+                    f"<a href='/diff?a={quote_plus(a_id)}&b={quote_plus(rid)}'>"
+                    f"set as B</a></li>"
+                )
+        body = [
+            "<h1>Diff two exchanges</h1>",
+            "<p class='muted'>Paste two exchange ids, or use the picker below.</p>",
+            f"<form class='diff-picker' method='get' action='/diff'>"
+            f"<label>A<input type='text' name='a' value='{esc(a_id)}' "
+            f"placeholder='exchange id' size='14'></label>"
+            f"<label>B<input type='text' name='b' value='{esc(b_id)}' "
+            f"placeholder='exchange id' size='14'></label>"
+            f"<button type='submit'>Diff</button>"
+            f"</form>",
+            "<h2>Recent exchanges</h2><ol class='diff-picker-list'>",
+            "".join(recent_picker),
+            "</ol>",
+        ]
+        return page("Diff", "".join(body), json_url=json_url)
+
+    if m["state"] == "not_found":
+        msg = []
+        if not m["a_found"]:
+            msg.append(f"A id <code>{esc(m['a_id'])}</code> not found.")
+        if not m["b_found"]:
+            msg.append(f"B id <code>{esc(m['b_id'])}</code> not found.")
+        body = [
+            "<h1>Diff</h1>",
+            f"<p class='status-err'>{' '.join(msg)}</p>",
+            "<p><a href='/diff'>← pick again</a></p>",
+        ]
+        return page("Diff (not found)", "".join(body), json_url=json_url)
+
+    # state == "ok"
+    a, b = m["a"], m["b"]
+    body = [
+        f"<h1>Diff <code>{esc(a['id'])}</code> ↔ <code>{esc(b['id'])}</code></h1>",
+        "<table class='diff-meta'>"
+        "<tr><th></th><th>A</th><th>B</th></tr>"
+        f"<tr><td>id</td>"
+        f"<td><a href='/requests/{esc(a['id'])}'><code>{esc(a['id'])}</code></a></td>"
+        f"<td><a href='/requests/{esc(b['id'])}'><code>{esc(b['id'])}</code></a></td></tr>"
+        f"<tr><td>ts</td><td>{esc(a['ts'])}</td><td>{esc(b['ts'])}</td></tr>"
+        f"<tr><td>agent</td>"
+        f"<td><span class='tag {esc(a['agent'])}'>{esc(a['agent'])}</span></td>"
+        f"<td><span class='tag {esc(b['agent'])}'>{esc(b['agent'])}</span></td></tr>"
+        f"<tr><td>path</td>"
+        f"<td><code>{esc(a['path'])}</code></td>"
+        f"<td><code>{esc(b['path'])}</code></td></tr>"
+        f"<tr><td>model</td>"
+        f"<td><code>{esc(a['model'] or '')}</code></td>"
+        f"<td><code>{esc(b['model'] or '')}</code></td></tr>"
+        f"<tr><td>status</td><td>{esc(a['status'])}</td><td>{esc(b['status'])}</td></tr>"
+        "</table>",
+    ]
+
+    sysd = m["system"]
+    body.append(
+        f"<h2>system <span class='muted'>"
+        f"(A {sysd['a_chars']} chars, B {sysd['b_chars']})</span></h2>"
+    )
+    if sysd["identical"]:
+        body.append("<p class='muted'>(identical)</p>")
+    elif not sysd["diff"]:
+        body.append("<p class='muted'>(no textual diff — content matches)</p>")
+    else:
+        body.append(
+            "<div class='diff-legend'>"
+            "<span class='diff-legend-key diff-remove'>"
+            "− red lines: in A only</span>"
+            "<span class='diff-legend-key diff-add'>"
+            "+ green lines: in B only</span>"
+            "<span class='diff-legend-key diff-context'>"
+            "  context: in both</span>"
+            "</div>"
+        )
+        body.append("<pre class='diff-block'>")
+        for line in sysd["diff"]:
+            body.append(
+                f"<span class='diff-{line['type']}'>{esc(line['text'])}</span>\n"
+            )
+        body.append("</pre>")
+
+    td = m["tools"]
+    body.append(
+        f"<h2>tools <span class='muted'>(A {td['a_total']}, B {td['b_total']})</span></h2>"
+    )
+    sections = []
+    if td["added"]:
+        sections.append(
+            "<p><b>Added in B</b>: "
+            + ", ".join(f"<code>{esc(n)}</code>" for n in td["added"])
+            + "</p>"
+        )
+    if td["removed"]:
+        sections.append(
+            "<p><b>Removed from A</b>: "
+            + ", ".join(f"<code>{esc(n)}</code>" for n in td["removed"])
+            + "</p>"
+        )
+    if td["changed"]:
+        sections.append(
+            "<p><b>Schema changed</b>: "
+            + ", ".join(f"<code>{esc(n)}</code>" for n in td["changed"])
+            + "</p>"
+        )
+    body.append(
+        "".join(sections)
+        if sections
+        else "<p class='muted'>(identical tool set)</p>"
+    )
+
+    md = m["messages"]
+    body.append(
+        f"<h2>messages <span class='muted'>"
+        f"(A {md['a_total']}, B {md['b_total']}, common prefix {md['common_prefix']})"
+        f"</span></h2>"
+    )
+    if md["a_total"] == md["b_total"] == md["common_prefix"]:
+        body.append("<p class='muted'>(messages identical)</p>")
+    else:
+        body.append(
+            f"<p class='muted'>First {md['common_prefix']} turn(s) identical. "
+            f"Diverging tails:</p>"
+            "<div class='diff-msg-cols'>"
+        )
+        for label, tail in (("A tail", md["a_tail"]), ("B tail", md["b_tail"])):
+            body.append(f"<div><h3>{label} ({len(tail)})</h3>")
+            if not tail:
+                body.append("<p class='muted'>(none)</p>")
+            for i, msg in enumerate(tail):
+                role = (msg.get("role") if isinstance(msg, dict) else None) or "?"
+                body.append(
+                    f"<details><summary>[{md['common_prefix'] + i}] role="
+                    f"<code>{esc(role)}</code></summary>"
+                    f"{render_json(msg)}</details>"
+                )
+            body.append("</div>")
+        body.append("</div>")
+
+    return page(f"Diff {a['id']} vs {b['id']}", "".join(body), json_url=json_url)
+
+
 def render_timeline(m, ctx=None):
     """Sequence-diagram-style flow with two lanes (agent ↔ API). Each captured
     exchange becomes two arrows: out (request) and in (response). Clicking an
@@ -1676,6 +2033,7 @@ ROUTES = [
     (re.compile(r"^/requests/(?P<xid>[0-9a-f]+)$"),         model_request,   render_request),
     (re.compile(r"^/skeleton/(?P<agent>[a-zA-Z0-9_-]+)$"),  model_skeleton,  render_skeleton),
     (re.compile(r"^/tools/(?P<agent>[a-zA-Z0-9_-]+)$"),     model_tools,     render_tools),
+    (re.compile(r"^/diff$"),                                model_diff,      render_diff),
 ]
 
 
