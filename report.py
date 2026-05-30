@@ -31,7 +31,7 @@ import sys
 import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 from analyze import skeleton, system_text, tool_names, tool_schema_key
 
@@ -255,6 +255,61 @@ def _fmt_gap(seconds):
     return f"{sign}{int(seconds // 86400)}d"
 
 
+def _flatten_messages_text(msgs):
+    """Concatenate every textual fragment in a messages/input array so a
+    substring search can hit user prompts, assistant replies, tool inputs,
+    tool results — anything readable that the model saw or wrote."""
+    if not isinstance(msgs, list):
+        return ""
+    parts = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            for cb in c:
+                if not isinstance(cb, dict):
+                    continue
+                for k in ("text", "input_text", "output_text"):
+                    v = cb.get(k)
+                    if isinstance(v, str):
+                        parts.append(v)
+                inp = cb.get("input")
+                if isinstance(inp, (dict, list)):
+                    parts.append(json.dumps(inp, ensure_ascii=False))
+                elif isinstance(inp, str):
+                    parts.append(inp)
+                content_field = cb.get("content")
+                if isinstance(content_field, str):
+                    parts.append(content_field)
+    return "\n\n".join(parts)
+
+
+def _make_snippet(text, query, context=40):
+    """Return a {before, match, after} snippet around the first case-insensitive
+    occurrence of `query` in `text`, or None if no hit. Whitespace is collapsed
+    so the snippet reads on a single visual line. The structured shape lets the
+    HTML renderer wrap the match in <mark> while JSON consumers do their own
+    highlighting."""
+    if not text or not query:
+        return None
+    norm = re.sub(r"\s+", " ", text).strip()
+    if not norm:
+        return None
+    idx = norm.lower().find(query.lower())
+    if idx < 0:
+        return None
+    start = max(0, idx - context)
+    end = min(len(norm), idx + len(query) + context)
+    return {
+        "before": ("…" if start > 0 else "") + norm[start:idx],
+        "match":  norm[idx:idx + len(query)],
+        "after":  norm[idx + len(query):end] + ("…" if end < len(norm) else ""),
+    }
+
+
 def _build_request_detail(r):
     """Project a raw request record into the dict shape used by the request
     detail view and the timeline expansion."""
@@ -394,6 +449,8 @@ def model_timeline(ctx):
     /api/timeline stays compact even with large logs."""
     agent_filter = (ctx["qs"].get("agent") or [None])[0]
     from_dt, to_dt = _compute_time_range(ctx["qs"], ctx["requests"])
+    q_raw = (ctx["qs"].get("q") or [""])[0]
+    q = q_raw.strip()
     events = []
     prev_ts = None
     exchanges = 0
@@ -408,6 +465,29 @@ def model_timeline(ctx):
             continue
         if to_dt and (ts_filter is None or ts_filter >= to_dt):
             continue
+
+        # --- full-text search filter -------------------------------------
+        # Search across system text, every messages turn, and the response
+        # reassembled text. Snippets are stashed per-event so the OUT card
+        # shows system/messages hits and the IN card shows response hits.
+        out_snippets, in_snippets = [], []
+        if q:
+            sys_t, _sys_blocks = system_text(r)
+            sys_t = sys_t or ""
+            msgs_t = _flatten_messages_text(
+                (r.get("extract") or {}).get("messages"))
+            paired_resp = ctx["responses"].get(xid) or {}
+            resp_t = ((paired_resp.get("reconstructed") or {}).get("text") or "")
+            blob = (sys_t + "\n" + msgs_t + "\n" + resp_t).lower()
+            if q.lower() not in blob:
+                continue
+            for src, body_text, bucket in (("system", sys_t, out_snippets),
+                                           ("messages", msgs_t, out_snippets),
+                                           ("response", resp_t, in_snippets)):
+                snip = _make_snippet(body_text, q)
+                if snip:
+                    snip["source"] = src
+                    bucket.append(snip)
         resp = ctx["responses"].get(xid, {})
         rc = resp.get("reconstructed") or {}
         i_tok, o_tok, cached = _usage_cells(rc.get("usage"))
@@ -431,6 +511,7 @@ def model_timeline(ctx):
             "method": r.get("method"), "path": r.get("path"),
             "msg_count": msg_count, "tool_count": tool_count,
             "system_chars": sys_chars,
+            "match_snippets": out_snippets,
         })
         if ts_out_p:
             prev_ts = ts_out_p
@@ -453,6 +534,7 @@ def model_timeline(ctx):
             "event_count": resp.get("event_count") if resp else None,
             "text_preview": (text[:80] + ("…" if len(text) > 80 else ""))
                             if isinstance(text, str) else None,
+            "match_snippets": in_snippets,
         })
         if ts_in_p:
             prev_ts = ts_in_p
@@ -546,7 +628,9 @@ def model_timeline(ctx):
 
     return {
         "agent_filter": agent_filter,
+        "search": q,
         "form": {
+            "q":     q_raw,
             "agent": agent_filter or "",
             "since": (ctx["qs"].get("since") or [""])[0],
             "from":  (ctx["qs"].get("from")  or [""])[0],
@@ -661,6 +745,30 @@ tr:hover td { background: #fafafa; }
 .seq-filter a.reset:hover { color: #555; text-decoration: underline; }
 .seq-active-range { margin: 0.2em 0 0.4em; }
 .seq-active-range code { font-size: 0.82em; }
+.seq-filter-q input { min-width: 20em; width: 100%; }
+.seq-filter-q { flex: 1 1 22em; }
+
+/* --- search-hit snippets shown inside an event summary --- */
+.seq-event-snippets {
+  margin: 0.35em 0 0.1em;
+  padding: 0.35em 0.55em;
+  background: #fff9d6;
+  border: 1px solid #f0e3a3;
+  border-radius: 3px;
+  font-size: 0.8em;
+  line-height: 1.45;
+}
+.seq-snippet + .seq-snippet { margin-top: 0.25em; padding-top: 0.25em;
+                              border-top: 1px dashed #ecdf9a; }
+.seq-snippet-src {
+  display: inline-block; min-width: 5em;
+  font-weight: 600; color: #886a00;
+  font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.seq-event-snippets mark {
+  background: #ffd23f; padding: 0 0.18em; border-radius: 2px;
+  font-weight: 600; color: #222;
+}
 
 /* --- per-hour density histogram --- */
 .seq-histogram {
@@ -1290,12 +1398,13 @@ def render_timeline(m, ctx=None):
     messages; resp shows reassembled text/usage/event_types."""
     form = m["form"]
     # Reconstruct the JSON URL with the same query params so the link in the
-    # nav matches what is currently filtered.
+    # nav matches what is currently filtered. quote_plus handles arbitrary
+    # text values (the search box can contain spaces, slashes, etc.).
     qs_bits = []
-    for k in ("agent", "since", "from", "to", "session_gap"):
+    for k in ("q", "agent", "since", "from", "to", "session_gap"):
         v = form.get(k)
         if v and (k != "session_gap" or v != "30"):
-            qs_bits.append(f"{k}={esc(v)}")
+            qs_bits.append(f"{k}={quote_plus(v)}")
     json_url = "/api/timeline" + ("?" + "&".join(qs_bits) if qs_bits else "")
 
     def opt(name, value, current, label=None):
@@ -1321,6 +1430,9 @@ def render_timeline(m, ctx=None):
     body = [
         "<h1>Timeline</h1>",
         f"<form class='seq-filter' method='get' action='/timeline'>"
+        f"<label class='seq-filter-q'>search<input type='search' name='q' "
+        f"value='{esc(form['q'])}' placeholder='system / messages / response text'>"
+        f"</label>"
         f"<label>agent<select name='agent'>{agent_opts}</select></label>"
         f"<label>since<select name='since'>{since_opts}</select></label>"
         f"<label>from (UTC)<input type='datetime-local' name='from' "
@@ -1500,6 +1612,23 @@ def render_timeline(m, ctx=None):
                 f"</div>"
             )
 
+        # Search-hit snippets (stays visible even when the card is collapsed,
+        # so the match is the first thing the user sees).
+        snippets_html = ""
+        if ev.get("match_snippets"):
+            parts = ["<div class='seq-event-snippets'>"]
+            for snip in ev["match_snippets"]:
+                parts.append(
+                    f"<div class='seq-snippet'>"
+                    f"<span class='seq-snippet-src'>{esc(snip.get('source', '?'))}:</span> "
+                    f"{esc(snip['before'])}"
+                    f"<mark>{esc(snip['match'])}</mark>"
+                    f"{esc(snip['after'])}"
+                    f"</div>"
+                )
+            parts.append("</div>")
+            snippets_html = "".join(parts)
+
         body.append(
             f"<li class='seq-event' data-dir='{esc(direction)}' "
             f"data-agent='{esc(agent)}' id='ex-{esc(ev['id'])}-{esc(direction)}'>"
@@ -1517,6 +1646,7 @@ def render_timeline(m, ctx=None):
             f"<span class='seq-meta'>{meta}</span>"
             f"</span>"
             f"{rtt_row}"
+            f"{snippets_html}"
             f"</summary>"
             f"<div class='seq-msg-body'>"
             f"<p class='muted'><a href='/requests/{esc(ev['id'])}'>open full page →</a></p>"
