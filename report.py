@@ -310,6 +310,25 @@ def _make_snippet(text, query, context=40):
     }
 
 
+def _extract_invoked_tools(resp):
+    """List of {name, input} representing the tools the model actually called
+    in this response. Currently populated when the proxy reassembled tool_uses
+    (Claude streaming). For Codex the proxy does not yet extract function_call
+    items from the Responses API stream, so the list is empty for codex
+    exchanges — to be fixed in a follow-up by extending
+    proxy.reconstruct_codex_responses."""
+    rc = (resp or {}).get("reconstructed") or {}
+    tu = rc.get("tool_uses")
+    if not isinstance(tu, list):
+        return []
+    out = []
+    for t in tu:
+        if isinstance(t, dict):
+            out.append({"name": t.get("name"),
+                        "input": t.get("input")})
+    return out
+
+
 def _build_request_detail(r):
     """Project a raw request record into the dict shape used by the request
     detail view and the timeline expansion."""
@@ -419,7 +438,30 @@ def model_tools(ctx):
         if isinstance(t, list) and t:
             tools, chosen_ts = t, r.get("ts")
             break
-    return {"agent": agent, "ts": chosen_ts, "tools": tools or []}
+
+    # Aggregate actual invocation counts across all responses for this agent
+    # (reads what the model *called*, not what was available). Empty for codex
+    # until proxy.reconstruct_codex_responses learns to emit tool_uses.
+    invocation_counts = defaultdict(int)
+    exchanges_with_invocations = 0
+    for r in recs:
+        xid = r.get("id")
+        if not xid:
+            continue
+        invs = _extract_invoked_tools(ctx["responses"].get(xid))
+        if invs:
+            exchanges_with_invocations += 1
+        for inv in invs:
+            n = inv.get("name") or "?"
+            invocation_counts[n] += 1
+
+    return {
+        "agent": agent, "ts": chosen_ts,
+        "tools": tools or [],
+        "invocation_counts": dict(invocation_counts),
+        "exchanges_with_invocations": exchanges_with_invocations,
+        "exchanges_analyzed": len(recs),
+    }
 
 
 def _upstream_label(wire, path):
@@ -451,6 +493,7 @@ def model_timeline(ctx):
     from_dt, to_dt = _compute_time_range(ctx["qs"], ctx["requests"])
     q_raw = (ctx["qs"].get("q") or [""])[0]
     q = q_raw.strip()
+    invoked_filter = (ctx["qs"].get("invoked") or [""])[0].strip()
     events = []
     prev_ts = None
     exchanges = 0
@@ -465,6 +508,14 @@ def model_timeline(ctx):
             continue
         if to_dt and (ts_filter is None or ts_filter >= to_dt):
             continue
+
+        # --- which tools did the model actually invoke ------------------
+        resp_for_tools = ctx["responses"].get(xid) or {}
+        tools_invoked = _extract_invoked_tools(resp_for_tools)
+        if invoked_filter:
+            invoked_names = {t.get("name") for t in tools_invoked}
+            if invoked_filter not in invoked_names:
+                continue
 
         # --- full-text search filter -------------------------------------
         # Search across system text, every messages turn, and the response
@@ -535,6 +586,7 @@ def model_timeline(ctx):
             "text_preview": (text[:80] + ("…" if len(text) > 80 else ""))
                             if isinstance(text, str) else None,
             "match_snippets": in_snippets,
+            "tools_invoked": tools_invoked,
         })
         if ts_in_p:
             prev_ts = ts_in_p
@@ -630,13 +682,15 @@ def model_timeline(ctx):
         "agent_filter": agent_filter,
         "search": q,
         "form": {
-            "q":     q_raw,
-            "agent": agent_filter or "",
-            "since": (ctx["qs"].get("since") or [""])[0],
-            "from":  (ctx["qs"].get("from")  or [""])[0],
-            "to":    (ctx["qs"].get("to")    or [""])[0],
+            "q":       q_raw,
+            "agent":   agent_filter or "",
+            "since":   (ctx["qs"].get("since") or [""])[0],
+            "from":    (ctx["qs"].get("from")  or [""])[0],
+            "to":      (ctx["qs"].get("to")    or [""])[0],
             "session_gap": str(session_gap_s),
+            "invoked": invoked_filter,
         },
+        "invoked_filter": invoked_filter,
         "effective_from": from_dt.isoformat() if from_dt else None,
         "effective_to":   to_dt.isoformat()   if to_dt   else None,
         "session_gap_s": session_gap_s,
@@ -769,6 +823,27 @@ tr:hover td { background: #fafafa; }
   background: #ffd23f; padding: 0 0.18em; border-radius: 2px;
   font-weight: 600; color: #222;
 }
+
+/* --- tool invocation chips on IN arrows + counts on /tools/<agent> --- */
+.seq-invoked { margin: 0.35em 0 0.1em; padding: 0.2em 0; font-size: 0.82em;
+               display: flex; flex-wrap: wrap; gap: 0.3em; align-items: center; }
+.seq-invoked-label { font-size: 0.78em; }
+.seq-invoked-chip {
+  display: inline-block; padding: 0.1em 0.5em; border-radius: 3px;
+  background: #e6f0ff; color: #2c5aa0; text-decoration: none;
+  font-family: ui-monospace, monospace; font-size: 0.82em; font-weight: 500;
+  border: 1px solid #c7dcf5;
+}
+.seq-invoked-chip:hover { background: #d2e3ff; }
+.tool-count {
+  display: inline-block; margin-left: 0.7em; padding: 0.1em 0.5em;
+  border-radius: 3px; font-size: 0.78em;
+}
+.tool-count-used {
+  background: #e6f0ff; color: #2c5aa0; font-weight: 500;
+}
+.tool-count-used a { color: #2c5aa0; text-decoration: none; margin-left: 0.3em; }
+.tool-count-used a:hover { text-decoration: underline; }
 
 /* --- per-hour density histogram --- */
 .seq-histogram {
@@ -1376,17 +1451,45 @@ def render_tools(m, ctx=None):
         body.append("<p>No tools captured for this agent.</p>")
         return page(f"Tools {agent}", "".join(body),
                     json_url=f"/api/tools/{agent}")
-    body.append(f"<p class='muted'>{len(m['tools'])} tool(s) "
-                f"from the most recent request ({esc(m['ts'])})</p>")
-    for t in m["tools"]:
+    counts = m.get("invocation_counts") or {}
+    body.append(
+        f"<p class='muted'>{len(m['tools'])} tool(s) declared in the most "
+        f"recent request ({esc(m['ts'])}) · "
+        f"<b>{m.get('exchanges_with_invocations', 0)}</b>/"
+        f"{m.get('exchanges_analyzed', 0)} exchanges actually invoked a tool</p>"
+    )
+    if not counts and agent == "codex":
+        body.append("<p class='muted'>(note: codex tool invocations are not yet "
+                    "extracted by proxy.py — counts will appear once "
+                    "<code>reconstruct_codex_responses</code> learns to emit "
+                    "<code>tool_uses</code>)</p>")
+    # Order: invoked tools first (by descending count), then unused
+    ranked = sorted(
+        m["tools"],
+        key=lambda t: -counts.get((t.get("name") or
+                                   (t.get("function") or {}).get("name") or
+                                   t.get("type") or ""), 0),
+    )
+    for t in ranked:
         if not isinstance(t, dict):
             continue
         n = (t.get("name")
              or (t.get("function") or {}).get("name")
              or t.get("type")
              or "<unknown>")
-        body.append(f"<details><summary><code>{esc(n)}</code></summary>"
-                    f"{render_json(t)}</details>")
+        cnt = counts.get(n, 0)
+        count_chip = (
+            f"<span class='tool-count tool-count-used'>{cnt}× invoked "
+            f"<a href='/timeline?invoked={quote_plus(n)}&amp;agent={esc(agent)}'>"
+            f"→ filter</a></span>"
+            if cnt > 0 else
+            f"<span class='tool-count muted'>0× invoked</span>"
+        )
+        body.append(
+            f"<details><summary>"
+            f"<code>{esc(n)}</code> {count_chip}"
+            f"</summary>{render_json(t)}</details>"
+        )
     return page(f"Tools {agent}", "".join(body),
                 json_url=f"/api/tools/{agent}")
 
@@ -1401,7 +1504,7 @@ def render_timeline(m, ctx=None):
     # nav matches what is currently filtered. quote_plus handles arbitrary
     # text values (the search box can contain spaces, slashes, etc.).
     qs_bits = []
-    for k in ("q", "agent", "since", "from", "to", "session_gap"):
+    for k in ("q", "agent", "since", "from", "to", "session_gap", "invoked"):
         v = form.get(k)
         if v and (k != "session_gap" or v != "30"):
             qs_bits.append(f"{k}={quote_plus(v)}")
@@ -1442,6 +1545,9 @@ def render_timeline(m, ctx=None):
         f"<label>session gap (s)<input type='number' name='session_gap' "
         f"min='0' step='1' value='{esc(form['session_gap'])}' "
         f"style='width: 5em'></label>"
+        f"<label>tool invoked<input type='text' name='invoked' "
+        f"value='{esc(form['invoked'])}' placeholder='tool name' "
+        f"style='width: 10em'></label>"
         f"<button type='submit'>Apply</button>"
         f"<a class='reset' href='/timeline'>reset</a>"
         f"</form>",
@@ -1629,6 +1735,29 @@ def render_timeline(m, ctx=None):
             parts.append("</div>")
             snippets_html = "".join(parts)
 
+        # Tool invocation chips on IN arrows (which tools the model actually
+        # called in this response). Each chip is a link that filters the
+        # timeline down to other exchanges that invoked the same tool.
+        invoked_html = ""
+        if direction == "in" and ev.get("tools_invoked"):
+            chips = []
+            for inv in ev["tools_invoked"]:
+                tname = inv.get("name") or "?"
+                href = f"/timeline?invoked={quote_plus(tname)}"
+                if form.get("agent"):
+                    href += f"&agent={quote_plus(form['agent'])}"
+                chips.append(
+                    f"<a class='seq-invoked-chip' href='{esc(href)}' "
+                    f"title='filter timeline to exchanges invoking this tool'>"
+                    f"{esc(tname)}</a>"
+                )
+            invoked_html = (
+                f"<div class='seq-invoked'>"
+                f"<span class='seq-invoked-label muted'>invoked:</span> "
+                f"{''.join(chips)}"
+                f"</div>"
+            )
+
         body.append(
             f"<li class='seq-event' data-dir='{esc(direction)}' "
             f"data-agent='{esc(agent)}' id='ex-{esc(ev['id'])}-{esc(direction)}'>"
@@ -1647,6 +1776,7 @@ def render_timeline(m, ctx=None):
             f"</span>"
             f"{rtt_row}"
             f"{snippets_html}"
+            f"{invoked_html}"
             f"</summary>"
             f"<div class='seq-msg-body'>"
             f"<p class='muted'><a href='/requests/{esc(ev['id'])}'>open full page →</a></p>"
