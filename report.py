@@ -1026,6 +1026,20 @@ tr:hover td { background: #fafafa; }
 .diff-header  { background: #f7f7f9; color: #555; }
 .diff-context { color: #6a737d; }
 .diff-context::before { content: "  "; opacity: 0; }
+.diff-legend {
+  display: flex; flex-wrap: wrap; gap: 0.4em;
+  margin: 0.4em 0 0.6em; font-size: 0.78em;
+}
+.diff-legend-key {
+  padding: 0.18em 0.55em; border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  border: 1px solid rgba(0,0,0,0.06);
+}
+.diff-legend-key.diff-context { background: #f6f8fa; color: #555; }
+/* Suppress the automatic +/- prefix on the chips so the explicit symbols in
+   the chip text are not doubled up. */
+.diff-legend-key::before { content: ""; }
+
 .diff-msg-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1em; }
 .diff-msg-cols > div { padding: 0.5em 0.7em; background: #fafbfc;
                        border: 1px solid #eef0f3; border-radius: 4px; }
@@ -1657,6 +1671,16 @@ def render_diff(m, ctx=None):
     elif not sysd["diff"]:
         body.append("<p class='muted'>(no textual diff — content matches)</p>")
     else:
+        body.append(
+            "<div class='diff-legend'>"
+            "<span class='diff-legend-key diff-remove'>"
+            "− red lines: in A only</span>"
+            "<span class='diff-legend-key diff-add'>"
+            "+ green lines: in B only</span>"
+            "<span class='diff-legend-key diff-context'>"
+            "  context: in both</span>"
+            "</div>"
+        )
         body.append("<pre class='diff-block'>")
         for line in sysd["diff"]:
             body.append(
