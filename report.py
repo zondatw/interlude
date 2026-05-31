@@ -29,7 +29,7 @@ import os
 import re
 import statistics
 import threading
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
@@ -407,6 +407,32 @@ def _extract_invoked_tools(resp):
     return out
 
 
+def _extract_stop_reason(resp):
+    """Why did this response end? For Claude this is reconstructed.stop_reason
+    (end_turn / tool_use / stop_sequence / max_tokens). For Codex Responses
+    API the proxy does not surface a stop_reason field yet, so we fall back
+    to reconstructed.status as a stand-in signal — to be tightened in a
+    follow-up that extends proxy.reconstruct_codex_responses."""
+    rc = (resp or {}).get("reconstructed") or {}
+    sr = rc.get("stop_reason")
+    if sr:
+        return sr
+    status = rc.get("status")
+    if status:
+        return status
+    return None
+
+
+def _msgs_hash(msgs):
+    """Stable 12-char hash of a messages array. Two requests share a hash iff
+    the model saw the exact same conversation so far — i.e. a true retry, not
+    a continuation. Used to detect repeat runs (issue #10)."""
+    if not isinstance(msgs, list):
+        msgs = []
+    blob = json.dumps(msgs, sort_keys=True, ensure_ascii=False)
+    return hashlib.blake2s(blob.encode(), digest_size=6).hexdigest()
+
+
 def _build_request_detail(r):
     """Project a raw request record into the dict shape used by the request
     detail view and the timeline expansion."""
@@ -640,6 +666,7 @@ def model_timeline(ctx):
     q_raw = (ctx["qs"].get("q") or [""])[0]
     q = q_raw.strip()
     invoked_filter = (ctx["qs"].get("invoked") or [""])[0].strip()
+    repeats_only = (ctx["qs"].get("repeats") or [""])[0].strip() in ("1", "true", "yes")
     events = []
     prev_ts = None
     exchanges = 0
@@ -928,6 +955,72 @@ def model_timeline(ctx):
         )
     tokens_total = running
 
+    # --- Stop reason aggregation (issue #9) ---------------------------------
+    # Why did each response end? Aggregated overall + per session so the user
+    # can spot patterns like "lots of max_tokens cutoff" or "heavy tool_use".
+    stop_reasons = Counter()
+    stop_reasons_by_session = defaultdict(Counter)
+    for ev in events:
+        if ev["dir"] != "in":
+            continue
+        sr = _extract_stop_reason(ctx["responses"].get(ev["id"]))
+        if sr:
+            stop_reasons[sr] += 1
+            stop_reasons_by_session[ev.get("session_id")][sr] += 1
+    # serialize per-session Counters back to dicts for JSON output
+    for s in sessions:
+        s["stop_reasons"] = dict(stop_reasons_by_session.get(s["id"], {}))
+
+    # --- Repeat-prompt detection (issue #10) --------------------------------
+    # Walk OUT events; when consecutive requests have identical messages
+    # hashes (same agent + wire), they form a "repeat run". Pure retry vs
+    # continuation: continuation grows the messages array (thread detection
+    # caught it), repeat keeps the same array byte-for-byte.
+    repeat_meta = {}  # xid -> {"run_id", "index", "count"}
+    run_id = -1
+    run_idx = 0
+    prev_hash = None
+    prev_agent_wire = None
+    counts_per_run = defaultdict(int)
+    out_order = [ev for ev in events if ev["dir"] == "out"]
+    for ev in out_order:
+        raw = req_by_id.get(ev["id"])
+        if not raw:
+            continue
+        msgs = (raw.get("extract") or {}).get("messages")
+        h = _msgs_hash(msgs)
+        agent_wire = (raw.get("agent"), raw.get("wire"))
+        if h == prev_hash and agent_wire == prev_agent_wire and run_id >= 0:
+            run_idx += 1
+        else:
+            run_id += 1
+            run_idx = 0
+        repeat_meta[ev["id"]] = {"run_id": run_id, "index": run_idx}
+        counts_per_run[run_id] += 1
+        prev_hash = h
+        prev_agent_wire = agent_wire
+    # finalize counts + tag both out and in events with the same metadata
+    for ev in events:
+        meta = repeat_meta.get(ev["id"])
+        if meta:
+            ev["repeat_run_id"] = meta["run_id"]
+            ev["repeat_index"] = meta["index"]
+            ev["repeat_count"] = counts_per_run[meta["run_id"]]
+        else:
+            ev["repeat_run_id"] = None
+            ev["repeat_index"] = 0
+            ev["repeat_count"] = 1
+    repeats_summary = sorted(
+        ({"run_id": rid, "count": cnt} for rid, cnt in counts_per_run.items() if cnt > 1),
+        key=lambda r: -r["count"],
+    )
+
+    # `?repeats=1` applied late so it only narrows the visible set without
+    # disturbing earlier aggregations (sessions / hour buckets reflect the
+    # pre-filter view; that is intentional — the filter is a focusing lens).
+    if repeats_only:
+        events = [ev for ev in events if (ev.get("repeat_count") or 1) >= 2]
+
     return {
         "agent_filter": agent_filter,
         "search": q,
@@ -939,8 +1032,12 @@ def model_timeline(ctx):
             "to": (ctx["qs"].get("to") or [""])[0],
             "session_gap": str(session_gap_s),
             "invoked": invoked_filter,
+            "repeats": "1" if repeats_only else "",
         },
         "invoked_filter": invoked_filter,
+        "repeats_only": repeats_only,
+        "stop_reasons": dict(stop_reasons),
+        "repeats_summary": repeats_summary,
         "effective_from": from_dt.isoformat() if from_dt else None,
         "effective_to": to_dt.isoformat() if to_dt else None,
         "session_gap_s": session_gap_s,
@@ -1095,6 +1192,55 @@ tr:hover td { background: #fafafa; }
 }
 .tool-count-used a { color: #2c5aa0; text-decoration: none; margin-left: 0.3em; }
 .tool-count-used a:hover { text-decoration: underline; }
+
+/* --- stop reason mini-bar (issue #9) --- */
+.seq-stops {
+  margin: 0.6em 0 0.8em;
+  padding: 0.55em 0.8em;
+  background: #fafbfc;
+  border: 1px solid #eef0f3;
+  border-radius: 5px;
+}
+.seq-stops-title { font-size: 0.78em; margin-bottom: 0.35em; }
+.seq-stops-bar {
+  display: flex; width: 100%; height: 1.4em;
+  border-radius: 3px; overflow: hidden;
+  border: 1px solid #e4e7ea; background: #fff;
+}
+.seq-stop-seg {
+  display: flex; align-items: center; justify-content: center;
+  min-width: 1px; overflow: hidden;
+  font-size: 0.72em; color: #fff; font-weight: 500;
+  text-shadow: 0 0 2px rgba(0,0,0,0.25); white-space: nowrap;
+}
+.seq-stop-seg.stop-ok    { background: #5a9c4f; }   /* end_turn etc. */
+.seq-stop-seg.stop-tool  { background: #3a78c8; }   /* tool_use */
+.seq-stop-seg.stop-warn  { background: #d9534f; }   /* max_tokens */
+.seq-stop-seg .seq-stop-label { padding: 0 0.4em; }
+
+/* --- repeats summary line + per-event badge (issue #10) --- */
+.seq-repeats-summary {
+  margin: 0.3em 0 0.7em; padding: 0.45em 0.7em;
+  background: #fff5f3; border: 1px solid #ffd6cf;
+  border-radius: 4px; font-size: 0.82em; color: #6a2c1f;
+}
+.seq-repeats-summary a { color: #b3331f; font-weight: 500; }
+.seq-repeats-summary strong { color: #6a2c1f; }
+.seq-repeat-badge {
+  display: inline-block; padding: 0.1em 0.5em; border-radius: 3px;
+  font-size: 0.76em; font-family: ui-monospace, monospace;
+  margin-top: 0.25em;
+}
+.seq-repeat-badge.repeat-warn { background: #fff3cd; color: #856404;
+                                border: 1px solid #f0d77a; }
+.seq-repeat-badge.repeat-bad  { background: #f8d7da; color: #721c24;
+                                border: 1px solid #f0adb1; font-weight: 600; }
+
+/* shared checkbox style for filter form (?repeats=1 etc.) */
+.seq-filter-check {
+  flex-direction: row !important; gap: 0.35em !important; align-items: center;
+}
+.seq-filter-check input[type=checkbox] { margin: 0; }
 
 /* --- per-hour density histogram --- */
 .seq-histogram {
@@ -1591,6 +1737,66 @@ def _render_tokens_chart(tokens_series):
     )
 
 
+def _render_stop_reasons(stop_reasons):
+    """Tiny inline bar chart of stop_reason → count, between the histogram
+    and the token chart. max_tokens (truncation) gets a warning color so it
+    visually pops; tool_use is neutral; end_turn is muted (the boring happy
+    path)."""
+    if not stop_reasons:
+        return ""
+    total = sum(stop_reasons.values()) or 1
+    order = ["end_turn", "tool_use", "stop_sequence", "max_tokens", "completed", "incomplete"]
+    items = sorted(
+        stop_reasons.items(),
+        key=lambda kv: (order.index(kv[0]) if kv[0] in order else 99, -kv[1]),
+    )
+    parts = [
+        "<div class='seq-stops'>",
+        "<div class='seq-stops-title muted'>stop reasons "
+        f"<span class='muted'>({total} responses)</span></div>",
+        "<div class='seq-stops-bar'>",
+    ]
+    for reason, count in items:
+        pct = count / total * 100
+        cls = (
+            "stop-warn"
+            if reason == "max_tokens"
+            else ("stop-tool" if reason == "tool_use" else "stop-ok")
+        )
+        parts.append(
+            f"<span class='seq-stop-seg {cls}' style='width: {pct:.1f}%' "
+            f"title='{esc(reason)}: {count} ({pct:.0f}%)'>"
+            f"<span class='seq-stop-label'>{esc(reason)} {count}</span>"
+            f"</span>"
+        )
+    parts.append("</div></div>")
+    return "".join(parts)
+
+
+def _render_repeats_summary(repeats_summary, form):
+    """One-line summary: how many repeat runs >= 2 in the visible window
+    and a link to the focused view (?repeats=1) when there is anything to
+    show. Stays out of the way otherwise."""
+    if not repeats_summary:
+        return ""
+    total_runs = len(repeats_summary)
+    biggest = repeats_summary[0]["count"]
+    in_runs = sum(r["count"] for r in repeats_summary)
+    already_focused = form.get("repeats") == "1"
+    if already_focused:
+        link = "<a href='/timeline'>show all events</a>"
+    else:
+        link = "<a href='?repeats=1'>show only repeats →</a>"
+    return (
+        "<div class='seq-repeats-summary muted'>"
+        f"<strong>{total_runs}</strong> repeat run(s) detected · "
+        f"largest is <strong>{biggest}×</strong> · "
+        f"{in_runs} events live in a repeat run. "
+        f"{link}"
+        "</div>"
+    )
+
+
 def _render_request_detail(
     req, resp, *, top_h="h2", messages_open=False, text_open=True, parts="both"
 ):
@@ -2040,7 +2246,7 @@ def render_timeline(m, ctx=None):
     # nav matches what is currently filtered. quote_plus handles arbitrary
     # text values (the search box can contain spaces, slashes, etc.).
     qs_bits = []
-    for k in ("q", "agent", "since", "from", "to", "session_gap", "invoked"):
+    for k in ("q", "agent", "since", "from", "to", "session_gap", "invoked", "repeats"):
         v = form.get(k)
         if v and (k != "session_gap" or v != "30"):
             qs_bits.append(f"{k}={quote_plus(v)}")
@@ -2094,6 +2300,10 @@ def render_timeline(m, ctx=None):
         f"<label>tool invoked<input type='text' name='invoked' "
         f"value='{esc(form['invoked'])}' placeholder='tool name' "
         f"style='width: 10em'></label>"
+        f"<label class='seq-filter-check'>"
+        f"<input type='checkbox' name='repeats' value='1'"
+        f"{' checked' if form.get('repeats') == '1' else ''}> repeats only"
+        f"</label>"
         f"<button type='submit'>Apply</button>"
         f"<a class='reset' href='/timeline'>reset</a>"
         f"</form>",
@@ -2131,6 +2341,10 @@ def render_timeline(m, ctx=None):
                 f"</a>"
             )
         body.append("</div>")
+
+    # --- Stop reason breakdown + repeat-block summary (issues #9, #10) -----
+    body.append(_render_stop_reasons(m["stop_reasons"]))
+    body.append(_render_repeats_summary(m["repeats_summary"], form))
 
     # --- Token usage chart (per-call stacked bars + cumulative line) --------
     body.append(_render_tokens_chart(m["tokens_series"]))
@@ -2392,6 +2606,21 @@ def render_timeline(m, ctx=None):
                 f"</div>"
             )
 
+        # Repeat-run badge on OUT arrows (one per exchange so the badge does
+        # not appear twice on req+resp). Red when count >= 3 (likely actual
+        # stuck loop or retry storm); subtle when count == 2.
+        repeats_html = ""
+        rcount = ev.get("repeat_count") or 1
+        if direction == "out" and rcount >= 2:
+            cls = "repeat-bad" if rcount >= 3 else "repeat-warn"
+            ridx = (ev.get("repeat_index") or 0) + 1
+            repeats_html = (
+                f"<div class='seq-repeat-badge {cls}' "
+                f"title='same prompt sent {rcount} times in a row'>"
+                f"↻ repeat {ridx}/{rcount}"
+                f"</div>"
+            )
+
         body.append(
             f"<li class='seq-event' data-dir='{esc(direction)}' "
             f"data-agent='{esc(agent)}' id='ex-{esc(ev['id'])}-{esc(direction)}'>"
@@ -2411,6 +2640,7 @@ def render_timeline(m, ctx=None):
             f"{rtt_row}"
             f"{snippets_html}"
             f"{invoked_html}"
+            f"{repeats_html}"
             f"</summary>"
             f"<div class='seq-msg-body'>"
             f"<p class='muted'><a href='/requests/{esc(ev['id'])}'>open full page →</a></p>"
