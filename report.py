@@ -31,7 +31,7 @@ import statistics
 import sys
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
@@ -1681,6 +1681,37 @@ tr:hover td { background: #fafafa; }
 .seq-msg-body h4 { margin-top: 0.9em; margin-bottom: 0.2em; }
 .seq-msg-body h4:first-child { margin-top: 0; }
 
+/* === live tail pill (#12) === */
+.live-pill {
+  position: fixed; top: 1em; right: 1em;
+  display: flex; align-items: center; gap: 0.5em;
+  padding: 0.4em 0.7em; background: #fff;
+  border: 1px solid #d8dde3; border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  font-size: 0.82em; z-index: 100;
+}
+.live-status { font-weight: 600; color: #888; }
+.live-status.live-on  { color: #185; }
+.live-status.live-off { color: #c33; }
+.live-pause {
+  font-size: 0.85em; padding: 0.15em 0.6em;
+  background: #f1f3f5; border: 1px solid #d8dde3;
+  border-radius: 3px; cursor: pointer;
+}
+.live-pause:hover { background: #e6e8eb; }
+.live-count {
+  color: #06c; text-decoration: none; font-weight: 500;
+  white-space: nowrap;
+}
+.live-count:empty { display: none; }
+.live-count:hover { text-decoration: underline; }
+/* Newly appended rows briefly pulse so the eye catches them */
+.seq-event-live { animation: live-flash 1.5s ease-out; }
+@keyframes live-flash {
+  0%   { background: #fff3a3; }
+  100% { background: transparent; }
+}
+
 /* === overview CTA === */
 .ov-cta { display: inline-block; padding: 0.4em 0.9em; margin: 0.4em 0;
           border-radius: 4px; background: #06c; color: #fff;
@@ -3139,7 +3170,135 @@ def render_timeline(m, ctx=None):
     if current_session >= 0:
         body.append("</details>")
     body.append("</div>")
+
+    # Live tail (#12). The pill sits fixed top-right; clicking it does
+    # nothing — clicking the "N new" counter reloads the page so the
+    # appended events get folded into proper session groups by the
+    # server-side renderer. Pause stops the EventSource cleanly.
+    body.append(_live_tail_html())
     return page("Timeline", "".join(body), json_url=json_url)
+
+
+def _live_tail_html():
+    """HTML + JS for the /timeline live-tail pill (#12).
+
+    Keeps the JS small enough to ship inline: opens an EventSource against
+    /api/timeline/stream, appends each new record as an `.seq-live` row at
+    the bottom of the timeline so the user sees activity without F5, and
+    increments a counter that — when clicked — reloads for a proper
+    session-grouped re-render. Pause/resume toggles close() + new
+    EventSource so a paused tab has zero open sockets."""
+    return """
+<div class="live-pill" id="live-pill" hidden>
+  <span class="live-status">○ connecting</span>
+  <button type="button" class="live-pause">pause</button>
+  <a class="live-count" href="javascript:location.reload()" title="reload for proper session grouping"></a>
+</div>
+<script>
+(function() {
+  var seqDiv = document.querySelector('.seq');
+  if (!seqDiv) return;
+  var pill = document.getElementById('live-pill');
+  pill.hidden = false;
+  var statusEl = pill.querySelector('.live-status');
+  var pauseBtn = pill.querySelector('.live-pause');
+  var countEl = pill.querySelector('.live-count');
+  var es = null, paused = false, newCount = 0;
+
+  function setStatus(t, cls) {
+    statusEl.textContent = t;
+    statusEl.className = 'live-status ' + (cls || '');
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function appendRecord(rec) {
+    var li = document.createElement('li');
+    li.className = 'seq-event seq-event-live';
+    li.setAttribute('data-dir', rec.kind === 'request' ? 'out' : 'in');
+    li.setAttribute('data-agent', rec.agent || '?');
+    li.id = 'live-' + rec.id + '-' + rec.kind;
+
+    var time = (rec.ts || '').slice(11, 19);
+    var agentChip = '<span class="tag ' + escapeHtml(rec.agent) + '">' + escapeHtml(rec.agent) + '</span>';
+    var label, meta;
+    if (rec.kind === 'request') {
+      label = '<code>' + escapeHtml(rec.method || '') + ' ' + escapeHtml(rec.path || '') + '</code>';
+      meta = '<span class="muted">wire:' + escapeHtml(rec.wire || '?') + '</span>';
+    } else {
+      var sclass = (rec.status >= 400 ? 'status-err' : 'status-ok');
+      label = '<span class="' + sclass + '">' + escapeHtml(rec.status || '—') + '</span>';
+      var bits = [];
+      if (rec.model) bits.push(escapeHtml(rec.model));
+      if (rec.tokens_in != null) bits.push(rec.tokens_in + ' in');
+      if (rec.tokens_out != null) bits.push(rec.tokens_out + ' out');
+      meta = '<span class="muted">' + bits.join(' · ') + '</span>';
+    }
+    var arrow = rec.kind === 'request' ? '▶' : '◀';
+
+    li.innerHTML =
+      '<span class="seq-time">' + escapeHtml(time) + '</span>' +
+      '<span class="seq-gap"></span>' +
+      '<span class="seq-lane-l-cell">' + (rec.kind === 'request' ? agentChip : '') + '</span>' +
+      '<details class="seq-msg"><summary>' +
+        '<span class="seq-arrow-track">' +
+          '<span class="seq-arrow-line"></span>' +
+          '<span class="seq-arrow-head">' + arrow + '</span>' +
+        '</span>' +
+        '<span class="seq-label-row">' +
+          '<span class="seq-label">' + label + '</span>' +
+          '<span class="seq-meta">' + meta + '</span>' +
+        '</span>' +
+      '</summary><div class="seq-msg-body">' +
+        '<p class="muted"><a href="/requests/' + escapeHtml(rec.id) + '">open full page →</a></p>' +
+      '</div></details>' +
+      '<span class="seq-lane-r-cell">' + (rec.kind !== 'request' ? agentChip : '') + '</span>';
+
+    // Append to last seq-events list; create a live-only container if none.
+    var lastOl = seqDiv.querySelector('ol.seq-events:last-of-type');
+    if (!lastOl) {
+      lastOl = document.createElement('ol');
+      lastOl.className = 'seq-events';
+      seqDiv.appendChild(lastOl);
+    }
+    lastOl.appendChild(li);
+  }
+
+  function connect() {
+    es = new EventSource('/api/timeline/stream');
+    es.addEventListener('hello', function() { setStatus('● live', 'live-on'); });
+    es.addEventListener('new', function(ev) {
+      try { var rec = JSON.parse(ev.data); } catch(e) { return; }
+      appendRecord(rec);
+      newCount++;
+      countEl.textContent = '↑ ' + newCount + ' new (click to refresh)';
+    });
+    es.onerror = function() { setStatus('○ reconnecting', 'live-off'); };
+    es.onopen  = function() { setStatus('● live', 'live-on'); };
+  }
+
+  pauseBtn.addEventListener('click', function() {
+    if (paused) {
+      paused = false;
+      pauseBtn.textContent = 'pause';
+      newCount = 0; countEl.textContent = '';
+      connect();
+    } else {
+      paused = true;
+      if (es) { es.close(); es = null; }
+      pauseBtn.textContent = 'resume';
+      setStatus('○ paused', 'live-off');
+    }
+  });
+
+  connect();
+})();
+</script>
+"""
 
 
 # =============================================================================
@@ -3205,6 +3364,33 @@ def dispatch(url_path, qs, ctx_base):
 # =============================================================================
 
 
+def _sse_payload_for(record):
+    """Project a raw JSONL record into the small JSON shape the live-tail
+    client renders inline. Keeps the wire format tiny so a noisy capture
+    session doesn't flood the socket."""
+    payload = {
+        "id": record.get("id"),
+        "kind": record.get("kind", "request"),
+        "agent": record.get("agent"),
+        "ts": record.get("ts"),
+    }
+    if payload["kind"] == "request":
+        payload["method"] = record.get("method")
+        payload["path"] = record.get("path")
+        payload["wire"] = record.get("wire")
+    else:
+        payload["status"] = record.get("status")
+        rec = record.get("reconstructed") or {}
+        usage = rec.get("usage") or {}
+        # Tiny extras so the user can eyeball the response without clicking
+        if rec.get("model"):
+            payload["model"] = rec["model"]
+        if usage:
+            payload["tokens_in"] = usage.get("input_tokens")
+            payload["tokens_out"] = usage.get("output_tokens")
+    return payload
+
+
 def make_handler(logs_glob):
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -3216,6 +3402,12 @@ def make_handler(logs_glob):
             if path == "/favicon.ico":
                 self.send_response(204)
                 self.end_headers()
+                return
+
+            # Live tail (SSE) — long-lived response, must bypass the normal
+            # dispatch/_send path which uses Content-Length.
+            if path == "/api/timeline/stream":
+                self._handle_sse_stream()
                 return
 
             paths, recs = load_records(logs_glob)
@@ -3237,6 +3429,82 @@ def make_handler(logs_glob):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _handle_sse_stream(self):
+            """Server-Sent Events live tail for #12.
+
+            Seeds with the current record set (so the client doesn't get
+            spammed with the entire history on connect), then polls the log
+            glob once a second and emits one `event: new` per record that
+            wasn't in the seed. A `: keep-alive` ping every ~30s prevents
+            idle-connection eviction by proxies / load balancers. The thread
+            exits as soon as the client disconnects (write raises
+            BrokenPipeError) — that's the loop's only exit, which means no
+            memory leak across long sessions per the issue's acceptance
+            criteria."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            # nginx / cloudflare would otherwise buffer the stream
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            try:
+                _, seed_recs = load_records(logs_glob)
+            except Exception:
+                seed_recs = []
+            # Insertion-ordered so we can evict the oldest first once the set
+            # grows past MAX_SEEN. That keeps memory bounded across a
+            # long-lived `Ctrl-F5 / keep open all day` capture session — the
+            # "no memory leak" acceptance bullet on #12. If an evicted key
+            # somehow reappears (e.g. the file rotates and we re-read older
+            # records), the client just sees a duplicate row; not a
+            # correctness bug. 10k holds a full week of typical dev capture.
+            MAX_SEEN = 10_000
+            seen = OrderedDict.fromkeys((r.get("id"), r.get("kind", "request")) for r in seed_recs)
+
+            # Tell the client we connected (lets the UI show a green dot
+            # before any traffic actually lands).
+            try:
+                self.wfile.write(
+                    b'event: hello\ndata: {"seeded": ' + str(len(seen)).encode() + b"}\n\n"
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+
+            seq = 0
+            tick = 0
+            try:
+                while True:
+                    time.sleep(1.0)
+                    tick += 1
+                    try:
+                        _, recs = load_records(logs_glob)
+                    except Exception:
+                        recs = []
+                    for r in recs:
+                        key = (r.get("id"), r.get("kind", "request"))
+                        if key in seen:
+                            continue
+                        seen[key] = None
+                        while len(seen) > MAX_SEEN:
+                            seen.popitem(last=False)
+                        seq += 1
+                        payload = _sse_payload_for(r)
+                        msg = (
+                            f"id: {seq}\nevent: new\n"
+                            f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                        ).encode()
+                        self.wfile.write(msg)
+                        self.wfile.flush()
+                    if tick % 30 == 0:
+                        # Comment line keeps the connection warm without
+                        # being delivered to the client's `message` handler.
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
 
     return Handler
 
