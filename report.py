@@ -28,7 +28,9 @@ import math
 import os
 import re
 import statistics
+import sys
 import threading
+import time
 from collections import Counter, defaultdict
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
@@ -3239,6 +3241,44 @@ def make_handler(logs_glob):
     return Handler
 
 
+def _spawn_source_watcher(sources):
+    """Watch a list of source files; when any of them changes on disk,
+    re-exec the current process in place via os.execv. This keeps the
+    development loop to a single command — `uv run report.py serve` —
+    so the user never has to kill + restart by hand when a route or
+    renderer is edited.
+
+    Pure stdlib (threading + os.stat + os.execv); no inotify, no
+    watchdog. Polls once a second, which is plenty for a local dev UI."""
+    initial = {}
+    for path in sources:
+        try:
+            initial[path] = os.stat(path).st_mtime
+        except FileNotFoundError:
+            continue
+
+    def watch():
+        while True:
+            time.sleep(1.0)
+            for path, mtime0 in list(initial.items()):
+                try:
+                    mtime_now = os.stat(path).st_mtime
+                except FileNotFoundError:
+                    continue
+                if mtime_now != mtime0:
+                    print(
+                        f"[interlude-report] {os.path.basename(path)} changed — restarting",
+                        flush=True,
+                    )
+                    # os.execv replaces this process image; the listening
+                    # socket on `args.port` is released by the kernel as
+                    # part of the exec, then re-bound by the fresh process.
+                    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    t = threading.Thread(target=watch, daemon=True, name="interlude-reload")
+    t.start()
+
+
 def main():
     ap = argparse.ArgumentParser(description="Interlude analysis web UI.")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3249,12 +3289,32 @@ def main():
         default=".interlude/log-*.jsonl",
         help="glob for JSONL files (default: .interlude/log-*.jsonl)",
     )
+    sv.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="disable the auto-restart-on-source-change watcher",
+    )
     args = ap.parse_args()
 
     if args.cmd == "serve":
         httpd = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(args.logs))
         print(f"[interlude-report] http://127.0.0.1:{args.port}", flush=True)
         print(f"[interlude-report] watching {args.logs}", flush=True)
+        if not args.no_reload:
+            # Watch report.py itself + analyze.py (whose helpers we import).
+            # Both are absolute so cwd changes don't matter.
+            sources = [os.path.abspath(__file__)]
+            try:
+                import analyze as _analyze_mod
+
+                sources.append(os.path.abspath(_analyze_mod.__file__))
+            except Exception:
+                pass
+            _spawn_source_watcher(sources)
+            print(
+                "[interlude-report] auto-reload on (disable with --no-reload)",
+                flush=True,
+            )
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
