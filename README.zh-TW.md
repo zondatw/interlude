@@ -112,6 +112,41 @@ codex exec -s read-only \
 > （ChatGPT token 缺 `api.responses.write` scope）。請求仍會完整錄到，只是收不到回應——
 > 改用 route A 即可。
 
+## 桌面 App 支援
+
+### 支援矩陣
+
+| Agent / 介面 | 攔截機制 | 狀態 |
+|---|---|---|
+| **Claude Code**（CLI） | `ANTHROPIC_BASE_URL` 環境變數 | ✅ 已驗證，見上方 |
+| **Codex**（CLI） | `~/.codex/config.toml` 裡的 `model_providers.*.base_url` | ✅ 已驗證，見上方 |
+| **Codex IDE 擴充**（VS Code / JetBrains） | 與 CLI 共用 `~/.codex/config.toml`，依 [OpenAI 官方說明](https://developers.openai.com/codex/ide/settings) | ✅ 同設定即可（本機未直接驗證） |
+| **Codex 桌面版**（`codex app`） | 包裝同一個 CLI binary | ✅ 同設定即可（本機未直接驗證） |
+| **Claude Desktop**（GUI Electron app） | — | ❌ 不支援（見下方） |
+| Claude Desktop MCP 流量 | 本地 MCP stdio shim，包成 `.mcpb` / `.dxt` | 🔬 訊號不同——只能錄到 **tool 呼叫**，不是 model prompt。屬另一個 scope，目前未實作 |
+
+### Codex IDE / Codex 桌面版
+
+依 OpenAI 的 [Codex IDE settings 文件](https://developers.openai.com/codex/ide/settings)，IDE 擴充會讀同一份 `~/.codex/config.toml`，獨立的 `codex app` 也是包裝同一個 CLI binary。所以只要 `codex` 在 CLI 上已經能透過 interlude 跑通，IDE / 桌面版只要在它們的設定裡切換到 `model_provider=interlude`（或你在 config 中取的名字）就好——proxy 端 8789 / 8790 那組 listener 全部都接得到，不需要任何額外設定。
+
+### 為什麼 Claude Desktop 不支援
+
+interlude 的整體設計是 **顯式 reverse proxy、不做 TLS MITM**——A 段（agent ↔ proxy）跑明文 HTTP，B 段（proxy ↔ upstream）跑正常 HTTPS。這只能用在 agent 有開 base-URL 旋鈕的情況。
+
+Claude Desktop 沒有。我們查過：
+
+- `ANTHROPIC_BASE_URL` 只是 **Claude Code** 的功能，不是桌面版（見 [`code.claude.com/docs/en/env-vars`](https://code.claude.com/docs/en/env-vars)）。
+- macOS GUI app 連 shell 環境變數都不會繼承，要用 `launchctl setenv` 才能塞進去（[anthropics/claude-code#45994](https://github.com/anthropics/claude-code/issues/45994)）。
+- `HTTPS_PROXY` 透過 Electron / Chromium runtime 部分有效，但有被回報過會被 upstream 擋 403——TLS pinning 狀態無公開資料證實或反證（[anthropics/claude-code#53869](https://github.com/anthropics/claude-code/issues/53869)）。
+- 公開文件、設定面板、開發者選單裡都找不到 base-URL 設定。
+
+如果硬要錄 Claude Desktop 流量，剩兩條路，但**都不在本專案 scope 內**：
+
+1. **System-wide HTTPS proxy + 本地受信任 CA**。解密 Anthropic 的每條連線，但信任足跡變大、會牴觸 interlude「不碰 credential」的承諾，而且可能被 upstream pinning 擋掉。真的需要的話，請改用 mitmproxy / Charles Proxy——它們本來就明說自己在做什麼，interlude 不打算跟它們競爭。
+2. **MCP server shim**，包成 Desktop Extension（`.mcpb` / `.dxt`）。Claude Desktop 會讀 `~/Library/Application Support/Claude/claude_desktop_config.json`，把每個 MCP server 當 subprocess 用 stdio JSON-RPC 跑起來（[官方說明](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)）。interlude 可以做一個 shim 錄下「Claude Desktop ↔ 其他 MCP server 之間的 tool 呼叫」——但 model 真正的 prompt / completion 走的是 host 自己的 HTTPS 連線，跟 MCP 是分開的。訊號不同、scope 也不同，若有需要可另開 issue。
+
+**今天就想完整錄 Anthropic 端 prompt 的話，請用 Claude Code CLI 透過 interlude**——同一個模型、同一個 provider、有完整的 base-URL 支援。
+
 ## 錄到什麼
 
 log 在 `.interlude/log-<時間戳>.jsonl`，每筆交換**兩行**、用 `id` 配對：
@@ -259,6 +294,10 @@ uv run analyze.py
 - proxy 剝掉請求的 `accept-encoding`，所以錄到的 bytes 永遠是明文（免處理 gzip/br）。
 - 自查惡意連線：`lsof -nP -iTCP -sTCP:ESTABLISHED | grep Python`，確認 proxy 只連
   `api.anthropic.com` / `api.openai.com` / `chatgpt.com`。
+- **絕不做 TLS 攔截。** interlude 只攔截有開 base-URL 旋鈕的 agent（Claude Code、Codex
+  CLI / IDE / 桌面版）。**不會**安裝 CA、終結 upstream TLS、或透明代理其他 app 的連線。
+  這是刻意的信任邊界——若要錄 Claude Desktop GUI，請改用講清楚自己威脅模型的工具
+  （mitmproxy、Charles Proxy）。見上方「桌面 App 支援」。
 
 ## 擴充新 agent
 

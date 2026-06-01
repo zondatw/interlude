@@ -145,6 +145,41 @@ codex exec -s read-only \
 > `api.responses.write` scope). The request is still recorded in full; you just
 > get no response back — switch to route A instead.
 
+## Desktop apps
+
+### Support matrix
+
+| Agent / surface | Capture mechanism | Status |
+|---|---|---|
+| **Claude Code** (CLI) | `ANTHROPIC_BASE_URL` env var | ✅ tested, see above |
+| **Codex** (CLI) | `model_providers.*.base_url` in `~/.codex/config.toml` | ✅ tested, see above |
+| **Codex IDE extension** (VS Code / JetBrains) | shares `~/.codex/config.toml` with the CLI per [OpenAI docs](https://developers.openai.com/codex/ide/settings) | ✅ same recipe, untested locally |
+| **Codex desktop app** (`codex app`) | wraps the same CLI binary | ✅ same recipe, untested locally |
+| **Claude Desktop** (GUI Electron app) | — | ❌ not supported (see below) |
+| Claude Desktop MCP traffic | local MCP stdio shim packaged as `.mcpb` / `.dxt` | 🔬 different signal — captures **tool invocations only**, not model prompts. Separate scope, not implemented |
+
+### Codex IDE / Codex desktop
+
+Per OpenAI's [Codex IDE settings docs](https://developers.openai.com/codex/ide/settings) the IDE extension reuses `~/.codex/config.toml`, and the standalone `codex app` is built on the same CLI binary. So if interlude is already working with `codex` on the command line, you only need to switch the IDE / desktop app to use `model_provider=interlude` (or whatever name you chose in your config). No additional proxy work required — the same listener on 8789 / 8790 handles all of them.
+
+### Why Claude Desktop isn't supported
+
+Interlude's whole design is **explicit reverse proxy, no TLS MITM** — segment (A) between agent and proxy runs over plain HTTP, segment (B) between proxy and upstream is normal HTTPS. That model only works when the agent exposes a base-URL knob.
+
+Claude Desktop doesn't. We checked:
+
+- `ANTHROPIC_BASE_URL` is a **Claude Code** feature, not desktop (see [`code.claude.com/docs/en/env-vars`](https://code.claude.com/docs/en/env-vars)).
+- macOS GUI apps don't even inherit shell env vars without `launchctl setenv` ([anthropics/claude-code#45994](https://github.com/anthropics/claude-code/issues/45994)).
+- `HTTPS_PROXY` partially works via the Electron/Chromium runtime but has been seen to 403 against the upstream — TLS pinning status is unverified ([anthropics/claude-code#53869](https://github.com/anthropics/claude-code/issues/53869)).
+- No public docs surface a base-URL config field, dev-menu setting, or config file knob.
+
+That leaves two paths to capture Claude Desktop traffic, both **out of scope** for this project as stated:
+
+1. **System-wide HTTPS proxy with a locally-trusted CA.** Decrypts every Anthropic connection. Bigger trust footprint, inverts interlude's "we never touch credentials" guarantee, and may fail upstream pinning anyway. If you really want this, mitmproxy / Charles Proxy are the right tools — interlude isn't trying to compete there.
+2. **MCP server shim** as a Desktop Extension (`.mcpb` / `.dxt`). Claude Desktop reads `~/Library/Application Support/Claude/claude_desktop_config.json` and spawns each MCP server as a subprocess over stdio JSON-RPC ([support article](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop)). An interlude shim could record **tool-call traffic** between Claude Desktop and other MCP servers — but the model's actual prompts/completions go over the host's own HTTPS connection to Anthropic, separate from MCP. Different signal, different feature. Open a feature request if you want this.
+
+**For full-prompt capture today on the Anthropic side, use Claude Code CLI** — same model, same provider, full base-URL support.
+
 ## What gets recorded
 
 Logs live in `.interlude/log-<timestamp>.jsonl`. Each exchange is **two lines**
@@ -308,6 +343,12 @@ When done, press `Ctrl-C` in Terminal 1 to shut the proxy down.
 - To check for rogue connections: `lsof -nP -iTCP -sTCP:ESTABLISHED | grep
   Python`, and confirm the proxy only connects to `api.anthropic.com` /
   `api.openai.com` / `chatgpt.com`.
+- **No TLS interception, ever.** Interlude only captures traffic from agents
+  that expose a base-URL knob (Claude Code, Codex CLI / IDE / desktop). It does
+  **not** install a CA, terminate upstream TLS, or transparently proxy other
+  apps' connections. That's a deliberate trust-boundary choice — if you need
+  Claude Desktop GUI capture, use a different tool (mitmproxy, Charles Proxy)
+  that's explicit about its threat model. See *Desktop apps* above.
 
 ## Adding a new agent
 
