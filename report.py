@@ -575,6 +575,47 @@ def model_tools(ctx):
     }
 
 
+def model_tool_invocations(ctx):
+    """Every invocation of a single named tool, across every captured
+    response for an agent. Each row carries the parent exchange id + ts +
+    path so the renderer can link straight back to /requests/<id>, and
+    the input args so the user can see what the model actually fed the
+    tool with."""
+    agent = ctx["params"]["agent"]
+    tool_name = ctx["params"]["tool"]
+    invocations = []
+    exchanges_touched = set()
+    for r in sorted(ctx["requests"], key=lambda x: x.get("ts", "")):
+        if r.get("agent") != agent:
+            continue
+        xid = r.get("id")
+        if not xid:
+            continue
+        resp = ctx["responses"].get(xid)
+        for inv in _extract_invoked_tools(resp):
+            if inv.get("name") != tool_name:
+                continue
+            invocations.append(
+                {
+                    "ts": (resp or {}).get("ts") or r.get("ts"),
+                    "exchange_id": xid,
+                    "exchange_path": r.get("path"),
+                    "exchange_wire": r.get("wire"),
+                    "input": inv.get("input"),
+                }
+            )
+            exchanges_touched.add(xid)
+    # Session cross-ref intentionally left off — consumers can join via
+    # exchange_id → /api/timeline events if they want it.
+    return {
+        "agent": agent,
+        "tool_name": tool_name,
+        "count": len(invocations),
+        "exchanges": len(exchanges_touched),
+        "invocations": invocations,
+    }
+
+
 def _upstream_label(wire, path):
     """Derive the upstream-host label for the API lane based on wire format
     and path. The proxy listener mapping is static (see proxy.py LISTENERS),
@@ -1192,6 +1233,19 @@ tr:hover td { background: #fafafa; }
 }
 .tool-count-used a { color: #2c5aa0; text-decoration: none; margin-left: 0.3em; }
 .tool-count-used a:hover { text-decoration: underline; }
+
+/* --- per-tool invocation log (issue #14) --- */
+.tool-inv-table { width: 100%; border-collapse: collapse; margin: 1em 0; }
+.tool-inv-table th, .tool-inv-table td {
+  border-bottom: 1px solid #eee; padding: 0.45em 0.7em;
+  vertical-align: top; font-size: 0.86em;
+}
+.tool-inv-table th { background: #f7f7f9; font-weight: 600; position: sticky; top: 0; }
+.tool-inv-table td:first-child { white-space: nowrap; }
+.tool-inv-table td:nth-child(2),
+.tool-inv-table td:nth-child(3) { font-family: ui-monospace, monospace; font-size: 0.78em; }
+.tool-inv-input { max-width: 50%; }
+.tool-inv-input details > summary { font-size: 0.82em; color: #06c; }
 
 /* --- stop reason mini-bar (issue #9) --- */
 .seq-stops {
@@ -2034,6 +2088,49 @@ def render_skeleton(m, ctx=None):
     return page(f"Skeleton {agent}", "".join(body), json_url=f"/api/skeleton/{agent}")
 
 
+def render_tool_invocations(m, ctx=None):
+    agent = m["agent"]
+    tool = m["tool_name"]
+    json_url = f"/api/tools/{quote_plus(agent)}/{quote_plus(tool)}/invocations"
+    body = [
+        f"<h1>Invocations · <span class='tag {esc(agent)}'>{esc(agent)}</span>"
+        f" · <code>{esc(tool)}</code></h1>",
+        f"<p><a href='/tools/{esc(agent)}'>← back to {esc(agent)} tools</a></p>",
+    ]
+    if not m["invocations"]:
+        body.append(
+            "<p class='muted'>No invocations of "
+            f"<code>{esc(tool)}</code> captured for this agent.</p>"
+        )
+        if agent == "codex":
+            body.append(
+                "<p class='muted'>(reminder: codex tool invocations are not yet "
+                "extracted by proxy.py — counts will appear once "
+                "<code>reconstruct_codex_responses</code> learns to emit "
+                "<code>tool_uses</code>)</p>"
+            )
+        return page(f"{tool} invocations · {agent}", "".join(body), json_url=json_url)
+
+    body.append(
+        f"<p class='muted'>{m['count']} invocation(s) "
+        f"across {m['exchanges']} exchange(s)</p>"
+        "<table class='tool-inv-table'>"
+        "<tr><th>ts (UTC)</th><th>exchange</th><th>path</th><th>input</th></tr>"
+    )
+    for inv in m["invocations"]:
+        body.append(
+            "<tr>"
+            f"<td><code>{esc(inv.get('ts') or '')}</code></td>"
+            f"<td><a href='/requests/{esc(inv['exchange_id'])}'>"
+            f"<code>{esc(inv['exchange_id'])}</code></a></td>"
+            f"<td><code>{esc(inv.get('exchange_path') or '')}</code></td>"
+            f"<td class='tool-inv-input'>{render_json(inv.get('input'))}</td>"
+            "</tr>"
+        )
+    body.append("</table>")
+    return page(f"{tool} invocations · {agent}", "".join(body), json_url=json_url)
+
+
 def render_tools(m, ctx=None):
     agent = m["agent"]
     body = [f"<h1>Tools · <span class='tag {esc(agent)}'>{esc(agent)}</span></h1>"]
@@ -2069,7 +2166,9 @@ def render_tools(m, ctx=None):
         count_chip = (
             f"<span class='tool-count tool-count-used'>{cnt}× invoked "
             f"<a href='/timeline?invoked={quote_plus(n)}&amp;agent={esc(agent)}'>"
-            f"→ filter</a></span>"
+            f"→ filter</a> · "
+            f"<a href='/tools/{esc(agent)}/{quote_plus(n)}/invocations'>"
+            f"→ list args</a></span>"
             if cnt > 0
             else "<span class='tool-count muted'>0× invoked</span>"
         )
@@ -2671,6 +2770,11 @@ ROUTES = [
     (re.compile(r"^/requests/(?P<xid>[0-9a-f]+)$"), model_request, render_request),
     (re.compile(r"^/skeleton/(?P<agent>[a-zA-Z0-9_-]+)$"), model_skeleton, render_skeleton),
     (re.compile(r"^/tools/(?P<agent>[a-zA-Z0-9_-]+)$"), model_tools, render_tools),
+    (
+        re.compile(r"^/tools/(?P<agent>[a-zA-Z0-9_-]+)/(?P<tool>[A-Za-z0-9_-]+)/invocations$"),
+        model_tool_invocations,
+        render_tool_invocations,
+    ),
     (re.compile(r"^/diff$"), model_diff, render_diff),
 ]
 
