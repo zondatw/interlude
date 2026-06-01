@@ -45,6 +45,63 @@ _CACHE = {}  # path -> (mtime, [records])
 _CACHE_LOCK = threading.Lock()
 
 
+def _normalize_model_key(model_id):
+    """Bucket a versioned model id under a stable family key for aggregation.
+    `claude-sonnet-4-5-20250929` → `claude-sonnet-4-5`,
+    `gpt-5.5-2026-01-15`        → `gpt-5.5`,
+    `claude-3-5-sonnet-20241022`→ `claude-3-5-sonnet`.
+
+    Conservative: only strips a trailing `-YYYYMMDD` or `-vN`. Returns the
+    input unchanged for anything else, so a model we don't recognize still
+    gets its own bucket rather than being silently merged with another."""
+    if not model_id or not isinstance(model_id, str):
+        return None
+    return re.sub(r"-(?:\d{8}|v\d+)$", "", model_id)
+
+
+def _tokens_by_model(events):
+    """Bucket per-event token usage by normalized model family. Returns a
+    list sorted by descending total tokens — the top consumer first.
+
+    Each bucket carries calls + tokens_in (uncached) + tokens_out + cached.
+    Cache-hit rate is derived in the renderer (cached / (in + cached)) so a
+    100% cache-hit session shows as "100% cached" rather than divided-by-
+    zero noise."""
+    buckets = {}
+    for ev in events:
+        if ev["dir"] != "in":
+            continue
+        model = ev.get("model")
+        if not model:
+            continue
+        key = _normalize_model_key(model)
+        b = buckets.setdefault(
+            key,
+            {
+                "model_key": key,
+                "calls": 0,
+                "tokens_in": 0,
+                "tokens_out": 0,
+                "tokens_cached": 0,
+            },
+        )
+        b["calls"] += 1
+        for src, dst in (
+            ("tokens_in", "tokens_in"),
+            ("tokens_out", "tokens_out"),
+            ("tokens_cached", "tokens_cached"),
+        ):
+            v = ev.get(src)
+            if isinstance(v, int):
+                b[dst] += v
+    out = []
+    for b in buckets.values():
+        b["tokens_total"] = b["tokens_in"] + b["tokens_out"] + b["tokens_cached"]
+        out.append(b)
+    out.sort(key=lambda b: b["tokens_total"], reverse=True)
+    return out
+
+
 def load_records(glob_pattern):
     """Return (sorted file paths, flat record list). Reuse parsed records when
     a file's mtime is unchanged. Pre-Phase-4 records get a synthesized stable
@@ -1182,6 +1239,14 @@ def model_timeline(ctx):
         "hour_buckets": hour_buckets,
         "tokens_series": tokens_series,
         "tokens_total": tokens_total,
+        # Per-model token rollup (#13). Token counts are exact (they come
+        # straight from the provider's usage block), so the breakdown is
+        # honest. Dollar amounts would require a pricing snapshot that
+        # silently goes stale — we trade precision-of-dollars for
+        # accuracy-of-tokens. The renderer surfaces cache-hit rate as a
+        # derived "% cached" so the user can still see prompt-cache value
+        # without us inventing a price.
+        "tokens_by_model": _tokens_by_model(events),
         "exchanges": exchanges,
         "event_count": len(events),
         "events": events,
@@ -1681,6 +1746,37 @@ tr:hover td { background: #fafafa; }
 .seq-msg-body h4 { margin-top: 0.9em; margin-bottom: 0.2em; }
 .seq-msg-body h4:first-child { margin-top: 0; }
 
+/* === tokens by model panel (#13) === */
+.tokens-by-model {
+  margin: 0.8em 0;
+  padding: 0.7em 0.9em;
+  background: #f3f7fa;
+  border: 1px solid #cfd9e2;
+  border-radius: 4px;
+}
+.tokens-by-model-title { margin-bottom: 0.25em; font-size: 0.78em; }
+.tokens-headline { font-size: 0.95em; margin-bottom: 0.4em; }
+.tokens-total {
+  font-weight: 700; color: #2a4a6d; font-size: 1.1em;
+  font-family: ui-monospace, monospace;
+}
+.tokens-cache-pct {
+  font-weight: 700; color: #2a5d34;
+  font-family: ui-monospace, monospace;
+}
+.tokens-by-model-table {
+  margin: 0; width: auto; min-width: 36em;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.tokens-by-model-table th, .tokens-by-model-table td {
+  padding: 0.25em 0.7em; font-size: 0.84em;
+}
+.tokens-by-model-table th { background: #e3ecf2; }
+.tokens-by-model-table td.num, .tokens-by-model-table th.num {
+  text-align: right;
+}
+.tokens-by-model-table .cache-pct { color: #2a5d34; font-weight: 600; }
+
 /* === live tail pill (#12) === */
 .live-pill {
   position: fixed; top: 1em; right: 1em;
@@ -1995,6 +2091,67 @@ def _render_tokens_chart(tokens_series):
         f"<div class='seq-tokens-axis muted'>"
         f"<span>{esc(start_lbl)}</span><span>{esc(end_lbl)}</span>"
         f"</div>"
+        f"</div>"
+    )
+
+
+def _render_tokens_by_model(tokens_by_model):
+    """Top-of-timeline panel: per-model token usage with cache-hit rate.
+
+    Answers the practical questions #13 was asking ("which model is
+    burning the most through me?" / "is prompt cache actually helping?")
+    in pure token counts — no fabricated dollar amounts. Cache-hit rate
+    is a meaningful, provider-reported number; dollar conversion is not
+    without a current pricing snapshot, so we leave that to whoever
+    needs it (multiply by their own price)."""
+    if not tokens_by_model:
+        return ""
+
+    # Roll up from the already-bucketed data so this stays consistent with
+    # the per-row numbers below (tokens_total in the parent model is just
+    # the input+output sum and doesn't separate cached).
+    total_in = sum(b["tokens_in"] for b in tokens_by_model)
+    total_out = sum(b["tokens_out"] for b in tokens_by_model)
+    total_cached = sum(b["tokens_cached"] for b in tokens_by_model)
+    total_billable_input = total_in + total_cached
+    overall_cache_pct = (
+        (total_cached / total_billable_input * 100) if total_billable_input > 0 else 0.0
+    )
+
+    # Per-model rows. Cache % = cached / (uncached_in + cached) — i.e. what
+    # fraction of "all input tokens ever sent" came from cache.
+    rows = []
+    for b in tokens_by_model[:8]:
+        billable_input = b["tokens_in"] + b["tokens_cached"]
+        cache_pct = (b["tokens_cached"] / billable_input * 100) if billable_input > 0 else 0.0
+        rows.append(
+            f"<tr>"
+            f"<td><code>{esc(b['model_key'])}</code></td>"
+            f"<td class='num'>{b['calls']:,}</td>"
+            f"<td class='num'>{b['tokens_in']:,}</td>"
+            f"<td class='num'>{b['tokens_out']:,}</td>"
+            f"<td class='num'>{b['tokens_cached']:,}</td>"
+            f"<td class='num'>{b['tokens_total']:,}</td>"
+            f"<td class='num cache-pct' "
+            f"title='cached / (uncached_in + cached)'>{cache_pct:.0f}%</td>"
+            f"</tr>"
+        )
+    return (
+        f"<div class='tokens-by-model'>"
+        f"<div class='tokens-by-model-title muted'>tokens by model</div>"
+        f"<div class='tokens-headline'>"
+        f"<span class='tokens-total'>{total_in + total_out + total_cached:,}</span>"
+        f"<span class='muted'> tokens total · </span>"
+        f"<span class='tokens-cache-pct'>{overall_cache_pct:.0f}%</span>"
+        f"<span class='muted'> of input came from cache</span>"
+        f"</div>"
+        f"<table class='tokens-by-model-table'>"
+        f"<tr><th>model</th><th class='num'>calls</th>"
+        f"<th class='num'>uncached in</th><th class='num'>out</th>"
+        f"<th class='num'>cached in</th><th class='num'>total</th>"
+        f"<th class='num'>cache %</th></tr>"
+        f"{''.join(rows)}"
+        f"</table>"
         f"</div>"
     )
 
@@ -2882,6 +3039,11 @@ def render_timeline(m, ctx=None):
         body.append("</div>")
 
     # --- Stop reason breakdown + repeat-block summary (issues #9, #10) -----
+    # --- Per-model token rollup (#13) — placed up high so the headline
+    # "which model is doing most of the work + how much cache is helping"
+    # is one of the first things visible after the filter form.
+    body.append(_render_tokens_by_model(m["tokens_by_model"]))
+
     body.append(_render_stop_reasons(m["stop_reasons"]))
     body.append(_render_repeats_summary(m["repeats_summary"], form))
 
