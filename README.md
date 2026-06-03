@@ -23,23 +23,31 @@ socket — that's the interception point, and it never touches credentials.
 Responses are copied as they stream through a relay, then the SSE events are
 reassembled and archived once the stream ends. The agent notices nothing.
 
-## Requirements
+## Install
 
-- [`uv`](https://docs.astral.sh/uv/) (all Python in this project runs through uv)
-- `claude` (Claude Code CLI), `codex` (Codex CLI)
+Install once with [`pipx`](https://pipx.pypa.io/) (recommended) or
+[`uv tool`](https://docs.astral.sh/uv/concepts/tools/) — both put the
+`interlude` command on your PATH in an isolated environment, no
+project-level setup needed:
 
-For contributors: install [`pre-commit`](https://pre-commit.com/) and
-[`gitleaks`](https://github.com/gitleaks/gitleaks) (`brew install pre-commit gitleaks`),
-then run `pre-commit install` once. Subsequent `git commit` will auto-run
-ruff lint+format, hygiene checks (trailing whitespace, EOF, private keys,
-yaml/toml syntax), codespell, and gitleaks. Run `pre-commit run --all-files`
-to check the whole tree at once.
+```bash
+pipx install interlude
+# or
+uv tool install interlude
+```
+
+Requires Python 3.11+ and the agent CLIs you want to capture
+(`claude` and/or `codex`). Zero runtime dependencies — interlude is
+stdlib-only.
+
+For contributors hacking on interlude itself, see
+[Development setup](#development-setup) below.
 
 ## Quick start
 
 ```bash
 # 1. One command: starts the 3 proxy listeners AND the web UI on :8000
-uv run proxy.py
+interlude
 
 # 2. In another terminal, point Claude Code at it
 ANTHROPIC_BASE_URL=http://localhost:8788 claude
@@ -61,9 +69,12 @@ On startup the bundled launcher prints:
 [interlude-report] auto-reload on (disable with --no-reload)
 ```
 
-The web UI runs in a child process. If you edit `report.py` or `analyze.py`,
-the UI re-execs itself in place — the proxy keeps running and your live SSE
-streams stay intact. `Ctrl-C` on the proxy tears down both.
+`.interlude/log-<timestamp>.jsonl` lands under your current working
+directory (not next to the installed module), so run `interlude` from
+wherever you want the logs collected.
+
+The web UI runs in a child process. `Ctrl-C` on `interlude` tears down
+both proxy and UI cleanly.
 
 Each launch opens a fresh log file; every request prints one line such as
 `[claude] POST /v1/messages`.
@@ -71,11 +82,33 @@ Each launch opens a fresh log file; every request prints one line such as
 Variants:
 
 ```bash
-uv run proxy.py --no-ui            # proxy-only (e.g. CI / headless capture)
-uv run proxy.py --ui-port 9000     # bind the UI on a different port
-uv run report.py serve             # UI only, against existing logs
-uv run analyze.py                  # text report, no server
+interlude --no-ui            # proxy-only (e.g. CI / headless capture)
+interlude --ui-port 9000     # bind the UI on a different port
+interlude-report serve       # UI only, against existing logs
+interlude-analyze            # text report, no server
+python -m interlude          # module-form, equivalent to `interlude`
 ```
+
+## Development setup
+
+To hack on interlude itself, clone and use the source layout directly:
+
+```bash
+git clone https://github.com/zondatw/interlude.git
+cd interlude
+uv sync                              # installs the package in editable mode
+uv run interlude                     # runs from src/interlude/
+```
+
+For contributors: install [`pre-commit`](https://pre-commit.com/) and
+[`gitleaks`](https://github.com/gitleaks/gitleaks) (`brew install pre-commit gitleaks`),
+then run `pre-commit install` once. Subsequent `git commit` will auto-run
+ruff lint+format, hygiene checks (trailing whitespace, EOF, private keys,
+yaml/toml syntax), codespell, and gitleaks. Run `pre-commit run --all-files`
+to check the whole tree at once.
+
+Release flow (PyPI Trusted Publishing via the `beta` and `release`
+branches) is documented in [`docs/release.md`](docs/release.md).
 
 ## Pointing an agent at the proxy
 
@@ -172,10 +205,10 @@ Supported wire formats: `claude-messages` (`/v1/messages`), `codex-responses`
 ## Analysis
 
 ```bash
-uv run analyze.py                    # read every log in .interlude
-uv run analyze.py --agent claude     # one agent only
-uv run analyze.py --max-slots 30     # print more dynamic slots
-uv run analyze.py path/to/log.jsonl  # a specific file / glob
+interlude-analyze                    # read every log in .interlude
+interlude-analyze --agent claude     # one agent only
+interlude-analyze --max-slots 30     # print more dynamic slots
+interlude-analyze path/to/log.jsonl  # a specific file / glob
 ```
 
 The report covers:
@@ -197,9 +230,9 @@ skeleton-vs-slot highlighting in context, and a tools schema browser —
 launch the local web UI:
 
 ```bash
-uv run report.py serve                  # http://127.0.0.1:8000 (default)
-uv run report.py serve --port 9000
-uv run report.py serve --logs "other/path/log-*.jsonl"
+interlude-report serve                  # http://127.0.0.1:8000 (default)
+interlude-report serve --port 9000
+interlude-report serve --logs "other/path/log-*.jsonl"
 ```
 
 Routes:
@@ -240,7 +273,7 @@ To confirm each link in the chain by hand (rather than just running
 **Terminal 1** — start the proxy:
 
 ```bash
-uv run proxy.py
+interlude
 ```
 
 **Terminal 2** — send one message through Claude Code; it should reply `PONG`
@@ -291,7 +324,7 @@ Claude Code's connection pre-check `HEAD /` and can be ignored.)
 **View the structure analysis**:
 
 ```bash
-uv run analyze.py
+interlude-analyze
 ```
 
 When done, press `Ctrl-C` in Terminal 1 to shut the proxy down.
@@ -311,9 +344,10 @@ When done, press `Ctrl-C` in Terminal 1 to shut the proxy down.
 
 ## Adding a new agent
 
-Edit the `LISTENERS` list at the top of `proxy.py` and add a row
-`(port, upstream_host, label)`. Wire detection lives in `detect_wire()`, and
-field normalization in `extract()` (requests) and `reconstruct()` (responses).
+Edit the `LISTENERS` list at the top of `src/interlude/proxy.py` and add a
+row `(port, upstream_host, label)`. Wire detection lives in `detect_wire()`,
+and field normalization in `extract()` (requests) and `reconstruct()`
+(responses).
 
 ## Troubleshooting
 
@@ -326,10 +360,12 @@ field normalization in `extract()` (requests) and `reconstruct()` (responses).
 
 ## Files
 
-| File | Purpose |
+| Path | Purpose |
 |---|---|
-| `proxy.py` | Three-listener reverse proxy, streaming relay + SSE tee/reassembly |
-| `analyze.py` | Cross-request diff, fixed skeleton vs. dynamic slots, cross-agent comparison (text report) |
-| `report.py` | Local web UI (HTML + JSON) over the same analysis |
-| `dogfood.sh` | One-command end-to-end verification |
-| `.interlude/` | JSONL output (gitignored, sensitive) |
+| `src/interlude/proxy.py` | Three-listener reverse proxy, streaming relay + SSE tee/reassembly. Entry point: `interlude` |
+| `src/interlude/analyze.py` | Cross-request diff, fixed skeleton vs. dynamic slots, cross-agent comparison (text report). Entry point: `interlude-analyze` |
+| `src/interlude/report.py` | Local web UI (HTML + JSON) over the same analysis. Entry point: `interlude-report` |
+| `dogfood.sh` | One-command end-to-end verification (contributor-facing, not shipped in the wheel) |
+| `docs/release.md` | PyPI Trusted Publishing setup + per-release flow |
+| `.github/workflows/` | `beta.yml` (push to `beta` → test.pypi.org), `release.yml` (push to `release` → pypi.org) |
+| `.interlude/` | JSONL output, written under the user's cwd (gitignored, sensitive) |

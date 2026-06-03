@@ -35,7 +35,7 @@ from collections import Counter, OrderedDict, defaultdict
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
-from analyze import skeleton, system_text, tool_names, tool_schema_key
+from interlude.analyze import skeleton, system_text, tool_names, tool_schema_key
 
 # =============================================================================
 # DATA — log loading, grouping, per-agent aggregation
@@ -3796,10 +3796,13 @@ def main():
         print(f"[interlude-report] watching {args.logs}", flush=True)
         if not args.no_reload:
             # Watch report.py itself + analyze.py (whose helpers we import).
-            # Both are absolute so cwd changes don't matter.
+            # Both are absolute so cwd changes don't matter. The watcher is
+            # only useful in a source checkout — for `pipx`-installed users
+            # those files live under site-packages and don't get edited, so
+            # the watcher fires zero times and costs nothing.
             sources = [os.path.abspath(__file__)]
             try:
-                import analyze as _analyze_mod
+                from interlude import analyze as _analyze_mod
 
                 sources.append(os.path.abspath(_analyze_mod.__file__))
             except Exception:

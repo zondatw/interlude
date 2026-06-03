@@ -1,0 +1,109 @@
+# Test PyPI publish — issue #29.
+#
+# Triggered by pushing to the `beta` branch. Mirrors the
+# `zondatw/bot-cmder` / `zondatw/remote-cmder` pattern (branch-based
+# triggers, not tag-based) so a `git log beta` answers "what's currently
+# on test.pypi.org?":
+#
+#   git checkout beta
+#   git merge main          # forward whatever was just verified
+#   git push                # ← this is the trigger
+#
+# After the workflow goes green, eyeball
+# https://test.pypi.org/project/interlude/ in a browser. If the README
+# renders, license shows MIT, and `pipx install --index-url
+# https://test.pypi.org/simple/ --pip-args="--extra-index-url
+# https://pypi.org/simple/" interlude` works in a fresh shell → safe to
+# forward to the `release` branch.
+#
+# Auth: PyPI Trusted Publishing (OIDC). No long-lived TWINE_PASSWORD in
+# repo secrets — GitHub mints a short-lived token at publish time, and
+# test.pypi.org validates it against the pending publisher configured
+# on the index side. See docs/release.md for the one-time setup.
+
+name: beta
+
+on:
+  push:
+    branches: [beta]
+
+# Don't cancel an in-flight publish if a second push lands on beta —
+# that would leave test.pypi.org in an inconsistent state. Each push
+# waits for the previous to finish.
+concurrency:
+  group: beta-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Verify wheel ships every module
+        # Belt-and-suspenders check. Hatchling's src-layout discovery is
+        # robust but the cost of a missing module here is "the wheel
+        # ships and is broken" — much worse than failing CI.
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl)
+          echo "Inspecting $WHEEL"
+          for f in interlude/__init__.py interlude/__main__.py \
+                   interlude/proxy.py interlude/report.py interlude/analyze.py; do
+            unzip -l "$WHEEL" | grep -q "$f" || {
+              echo "ERROR: $f missing from wheel"
+              exit 1
+            }
+          done
+          echo "OK — all 5 modules present"
+
+      - name: Smoke-test install + entry points
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .smoke
+          VIRTUAL_ENV=.smoke uv pip install dist/*.whl
+          ./.smoke/bin/interlude --help > /dev/null
+          ./.smoke/bin/interlude-report --help > /dev/null
+          ./.smoke/bin/interlude-analyze --help > /dev/null
+          ./.smoke/bin/python -m interlude --help > /dev/null
+          echo "OK — all 3 console scripts + python -m form work"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 30
+
+  publish:
+    name: publish to test.pypi.org
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/project/interlude/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+        # No `password:` — Trusted Publishing supplies the token via the
+        # OIDC handshake; PyPI validates the GitHub claims against the
+        # pending publisher configured on test.pypi.org.

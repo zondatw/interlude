@@ -1,0 +1,104 @@
+# Production PyPI publish — issue #29.
+#
+# Triggered by pushing to the `release` branch. Mirrors the
+# `zondatw/bot-cmder` / `zondatw/remote-cmder` pattern — once a beta has
+# been verified on test.pypi.org via the `beta` workflow, forward to
+# release:
+#
+#   git checkout release
+#   git merge beta          # forward whatever was just verified
+#   git push                # ← this is the trigger
+#
+# After the workflow goes green, verify
+# https://pypi.org/project/interlude/. Optionally draft a GitHub release
+# for archeology — the `release` branch's HEAD answers "what's currently
+# on PyPI?" but a tagged release shows up nicer in the repo's release
+# history.
+#
+# Auth: PyPI Trusted Publishing (OIDC). No long-lived TWINE_PASSWORD in
+# repo secrets. See docs/release.md for the one-time setup.
+#
+# Safety: the `release` environment in repo Settings → Environments can
+# be configured with required reviewers — when set, this workflow pauses
+# at the publish step until someone clicks "Approve" in the Actions run
+# page. Recommended for prod pushes.
+
+name: release
+
+on:
+  push:
+    branches: [release]
+
+# Each push waits for the previous to finish — never overlap publishes.
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Verify wheel ships every module
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls dist/*.whl)
+          echo "Inspecting $WHEEL"
+          for f in interlude/__init__.py interlude/__main__.py \
+                   interlude/proxy.py interlude/report.py interlude/analyze.py; do
+            unzip -l "$WHEEL" | grep -q "$f" || {
+              echo "ERROR: $f missing from wheel"
+              exit 1
+            }
+          done
+          echo "OK — all 5 modules present"
+
+      - name: Smoke-test install + entry points
+        run: |
+          set -euo pipefail
+          uv venv --python 3.12 .smoke
+          VIRTUAL_ENV=.smoke uv pip install dist/*.whl
+          ./.smoke/bin/interlude --help > /dev/null
+          ./.smoke/bin/interlude-report --help > /dev/null
+          ./.smoke/bin/interlude-analyze --help > /dev/null
+          ./.smoke/bin/python -m interlude --help > /dev/null
+          echo "OK — all 3 console scripts + python -m form work"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 90
+
+  publish:
+    name: publish to pypi.org
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://pypi.org/project/interlude/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No `password:` and no `repository-url:` — defaults to pypi.org,
+        # token comes from the OIDC handshake against the pending
+        # publisher.

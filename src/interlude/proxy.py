@@ -33,7 +33,10 @@ LISTENERS = [
     (8790, "chatgpt.com", "codex"),  # Codex via ChatGPT login (chatgpt_base_url)
 ]
 
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".interlude")
+# `.interlude/` lives under the *user's cwd*, not next to the installed module —
+# otherwise an `interlude` invoked from any directory would dump logs deep inside
+# site-packages. Same behavior as before for users running from the repo root.
+LOG_DIR = os.path.join(os.getcwd(), ".interlude")
 LOG_PATH = None  # set in main()
 LOG_LOCK = threading.Lock()
 
@@ -428,17 +431,29 @@ def make_handler(upstream_host, agent_label):
 
 
 def _spawn_ui(port, logs_glob):
-    """Spawn `report.py serve` as a child process so the user gets capture +
-    web UI from one command. The child runs in its own Python process, so
-    its own auto-reload watcher can re-exec on report.py edits WITHOUT
-    touching the proxy — keeping live SSE streams intact.
+    """Spawn `interlude.report serve` as a child process so the user gets
+    capture + web UI from one command. The child runs in its own Python
+    process, so its own auto-reload watcher can re-exec on report.py edits
+    WITHOUT touching the proxy — keeping live SSE streams intact.
 
     Returns the Popen handle. Child stdout is piped through a daemon thread
-    that re-prints each line with a `[ui]` prefix so proxy and UI logs
-    interleave readably in one terminal."""
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.py")
+    that re-prints each line so proxy and UI logs interleave readably in one
+    terminal.
+
+    Module-form invocation (`-m interlude.report`) works both when running
+    from a wheel install (site-packages) and from a source checkout via
+    `uv run interlude`. Path-based invocation broke under the wheel."""
     proc = subprocess.Popen(
-        [sys.executable, script, "serve", "--port", str(port), "--logs", logs_glob],
+        [
+            sys.executable,
+            "-m",
+            "interlude.report",
+            "serve",
+            "--port",
+            str(port),
+            "--logs",
+            logs_glob,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=1,

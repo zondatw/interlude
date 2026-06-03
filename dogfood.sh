@@ -36,7 +36,7 @@ mkdir -p .interlude
 echo "==> starting proxy"
 # --no-ui keeps dogfood headless — no need to bind port 8000 just to make
 # one round-trip call.
-uv run proxy.py --no-ui > .interlude/_dogfood-proxy.log 2>&1 &
+uv run interlude --no-ui > .interlude/_dogfood-proxy.log 2>&1 &
 PROXY_PID=$!
 cleanup() { kill "$PROXY_PID" 2>/dev/null; }
 trap cleanup EXIT

@@ -2,11 +2,77 @@
 name = "interlude"
 version = "0.1.0"
 description = "Intercept and log AI coding agent <-> API traffic for prompt-architecture analysis."
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Zonda Yang" },
+]
+keywords = [
+    "ai-agents",
+    "claude-code",
+    "codex",
+    "llm-observability",
+    "prompt-analysis",
+    "reverse-proxy",
+    "sse",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Internet :: Proxy Servers",
+]
+# Zero runtime dependencies on purpose. Everything below is stdlib only.
 dependencies = []
 
-[tool.uv]
-package = false
+[project.urls]
+Homepage = "https://github.com/zondatw/interlude"
+Repository = "https://github.com/zondatw/interlude"
+Issues = "https://github.com/zondatw/interlude/issues"
+
+[project.scripts]
+# `interlude` is the headline command — bundled launcher (proxy + UI). The
+# other two map 1:1 to the per-module main()s so power users can run them
+# independently (e.g. UI-only against an existing log set, or a one-shot
+# text report from CI).
+interlude = "interlude.proxy:main"
+interlude-report = "interlude.report:main"
+interlude-analyze = "interlude.analyze:main"
+
+[build-system]
+# Hatchling is uv's default backend and the modern choice — minimal config,
+# discovers src/ layout automatically, and produces wheels without needing a
+# setup.py shim.
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Explicit src-layout package mapping. Without this hatchling would look for
+# top-level packages by name and fail because the project root only contains
+# the source under src/.
+packages = ["src/interlude"]
+
+[tool.hatch.build.targets.sdist]
+# What ships in the source distribution. Same as default plus we want to
+# ensure docs/ and contributor scripts are included so a sdist tarball is a
+# complete working copy.
+include = [
+    "src/interlude",
+    "README.md",
+    "README.zh-TW.md",
+    "LICENSE",
+    "docs",
+    "dogfood.sh",
+]
 
 [tool.ruff]
 line-length = 100
